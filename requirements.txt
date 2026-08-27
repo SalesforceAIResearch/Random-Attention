@@ -1,0 +1,25 @@
+# Pinned to the environment that produced every number in the paper (Python 3.10.14, CUDA 12.1).
+# torch and flash-attn are installed first by setup.sh (torch==2.4.0+cu121, flash-attn==2.7.3).
+transformers==5.0.0
+accelerate==1.14.0
+datasets==5.0.0
+triton==3.0.0
+numpy==2.4.6
+sympy==1.14.0
+latex2sympy2
+antlr4-python3-runtime
+pandas==3.0.3
+matplotlib==3.11.0
+tqdm
+Pebble==5.2.0
+timeout-decorator
+word2number
+regex
+rich
+huggingface_hub
+sentencepiece
+protobuf
+tabulate
+psutil
+# Do NOT add latex2sympy2_extended / math-verify: they pull a sympy that breaks latex2sympy2's parser,
+# which the math grader (kvcompress/harness/Utils) depends on.

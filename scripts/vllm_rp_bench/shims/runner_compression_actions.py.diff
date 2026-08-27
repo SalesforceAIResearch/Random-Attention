@@ -1,0 +1,14 @@
+--- refs/triattention/triattention/vllm/runtime/runner_compression_actions.py	2026-07-08 08:24:07.000000000 +0000
++++ scripts/vllm_rp_bench/shims/runner_compression_actions.py	2026-08-18 06:10:15.000000000 +0000
+@@ -187,6 +187,11 @@
+                     "req_id": req_id,
+                     "step": signal.step,
+                     "status": "applied",
++                    # SHIM (08-18): pre-step nct anchor for the scheduler-side offset.
++                    # The legacy offset (live num_computed_tokens - cache_len_after) is
++                    # overstated by 1 + lookahead_depth because nct advances at schedule
++                    # time; anchoring both terms pre-step makes the offset exact.
++                    "scheduler_nct_pre": _sched_nct,
+                     "reason": result.reason,
+                     "cache_len_after": cache_len_after,
+                     "details": result.details,

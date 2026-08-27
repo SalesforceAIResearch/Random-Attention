@@ -1,10 +1,111 @@
-# README
+# Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning
 
-A repo containing all the basic file templates and general guidelines for any open source project at Salesforce.
+Code for the paper *Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning*.
 
-## Usage
+**Random Attention** (`random_pp` in the code) is a signal-free KV-cache eviction policy for reasoning models:
+keep the prompt, then keep a *uniformly random* per-KV-head subset of the generated tokens up to the budget
+(plus a short recency window). It reads no attention scores, no value statistics, and no calibration data, so
+an eviction round costs only the compaction itself. On MATH-500, GPQA-Diamond, AIME, HMMT and LiveCodeBench, at
+matched budgets, it matches or beats learned selectors (SnapKV, R-KV, VaSE, TriAttention) on Qwen3-4B/14B/32B
+and Phi-4-reasoning, and it is the fastest evictor in both the Hugging Face harness and a vLLM serving stack.
+The repository contains the eviction engine, the evaluation harness, the significance tests, the efficiency
+benchmarks, the vLLM port, and the mechanism-study tooling that produced every number in the paper.
 
-It's required that all files must be placed at the top level of your repository.
+## Layout
 
-> **NOTE** Your README should contain detailed, useful information about the project!
+```
+kvcompress/engine/     KV-eviction engine: every method in the paper as an eviction mode (cache_utils.py),
+                       evict-attention forwards for Qwen3 / phi3 / llama, faithful TriAttention scorer, engine tests
+kvcompress/harness/    evaluation harness (adapted from VaSE, see docs/PROVENANCE.md): eval_hf.py, the sharded
+                       multi-worker launcher parallel_run_hf_mw.py, graders' utilities, TriAttention calibration + stats
+kvcompress/eval/       grading (math/science, LiveCodeBench), cell-integrity audit, paired significance tests,
+                       shard repair, LaTeX table generator
+kvcompress/analysis/   mechanism studies: retention logs, fork replay/autopsy, carrier mass, eviction timing bench
+kvcompress/synth/      the controlled synthetic-retrieval study (registered protocol, tables)
+scripts/run_cell.sh    canonical launcher for one (model, task, method, budget) accuracy cell
+scripts/grade_cell.sh  integrity check + grading of a cell
+scripts/efficiency/    HF throughput protocols (VaSE fixed-batch, iso-memory, max-batch, eviction-round timing)
+scripts/vllm_rp_bench/ Random Attention inside TriAttention's vLLM 0.19 runtime (own README + RUNBOOK)
+scripts/mechanism/     retention-log panels and fork-replay launchers
+figures/               figure scripts (read the graded TSVs)
+data/                  benchmark layout + our LiveCodeBench difficulty subsets (data/README.md)
+docs/METHODS.md        method -> flags -> directory conventions, task budgets, sharding rules, engine switches
+docs/PROVENANCE.md     what descends from VaSE / TriAttention and how it was changed (+ upstream_vase.diff)
+```
 
+## Setup
+
+```bash
+git clone https://github.com/SalesforceAIResearch/Random-Attention && cd Random-Attention
+bash setup.sh                 # Python 3.10 venv: torch 2.4.0 (cu121), flash-attn 2.7.3, transformers 5.0.0, ...
+. env.sh                      # RA_ROOT / RA_ENGINE / RA_DATA_DIR / RA_MODELS_DIR / PYTHONPATH
+```
+
+* **Models**: Hugging Face checkpoints under `$RA_MODELS_DIR/<name>` (default `models/`): `Qwen3-4B`,
+  `Qwen3-14B`, `Qwen3-32B`, `phi-4-reasoning`, optionally `DeepSeek-R1-Distill-Llama-8B`.
+* **Data**: `$RA_DATA_DIR/<task>/test.jsonl` -- see `data/README.md` for the format, sources and the frozen
+  AIME-2025 convention. Our LiveCodeBench subsets are included.
+* Hardware: the paper's cells ran on 8x H200 (141 GB) or 8x A100 (80 GB); 32B needs one worker per GPU.
+
+## Run an accuracy cell
+
+```bash
+scripts/run_cell.sh Qwen3-4B math random_pp          # K defaults to the task's ~4x point (1024 here)
+scripts/run_cell.sh Qwen3-4B math vase               # VaSE with the faithful n_large = K/4
+scripts/run_cell.sh Qwen3-4B math triattn            # TriAttention with per-model calibration stats
+scripts/run_cell.sh phi-4-reasoning gpqa snapkv 2048
+scripts/run_cell.sh Qwen3-32B aime25 rkv && scripts/run_cell.sh Qwen3-32B aime26 rkv
+```
+
+Add `--dry-run` to print the exact `parallel_run_hf_mw.py` command. Cells resume when re-launched; completions
+land under `results/<model>/<task>_K<K>/<method>/`. `docs/METHODS.md` lists every method's flags and the
+cell sizes (MATH 1000, GPQA 792, AIME 944, HMMT 960, LCB 1532 completions).
+
+## Grade, test, tabulate
+
+```bash
+scripts/grade_cell.sh Qwen3-4B math_K1024 dense,random_pp,attn,attn_rkv_l05,vase_faithful,triattn_ph_memofix
+python kvcompress/eval/stats_paired.py --base results/Qwen3-4B/math_K1024 --data_name math \
+       --method_a random_pp --methods_b attn,attn_rkv_l05,vase_faithful,triattn_ph_memofix   # paired bootstrap + sign test
+python kvcompress/eval/gen_paper_tables.py --results <graded.tsv> --lcb <lcb.tsv> --out tables/
+```
+
+`grade_cell.sh` runs `cell_integrity.py` first: grading is positional (problem = shard offset + line), so a
+mixed, ragged or overlapping cell is refused rather than silently mis-graded. Accuracy is `flag_acc`
+(answer correct); `acc_strict` additionally requires termination within the 32k cap and is reported as a
+diagnostic.
+
+## Efficiency
+
+* Hugging Face harness: `scripts/efficiency/*.sh` (fixed-batch VaSE protocol, iso-memory max-batch serving,
+  eviction-round timing). Never report tokens/s from the batched accuracy runs -- they share GPUs.
+* vLLM serving: `scripts/vllm_rp_bench/` -- Random Attention as a selector inside TriAttention's vLLM 0.19
+  runtime (their paged-KV compression machinery, our selection rule), with the accuracy-transfer check and the
+  runtime shims documented in its README.
+
+## Mechanism and synthetic studies
+
+`KEEPLOG=1` retention logging, `FORCE_KEEP_RANGE` fork replays (`kvcompress/analysis/fork_replay.py`,
+`fork_autopsy.py`), carrier-head mixing modes, and the registered synthetic-retrieval protocol
+(`kvcompress/synth/`) are described in `docs/METHODS.md` ("Engine environment switches").
+
+## License
+
+This project is released under the Apache License 2.0 (see `LICENSE.txt`); it is a research release accompanying an academic
+paper -- please read `AI_ETHICS.md`. Contributions: `CONTRIBUTING.md`; security reports: `SECURITY.md`.
+
+## Acknowledgements and third-party code
+
+The evaluation harness and the engine skeleton descend from [VaSE](https://github.com/terarachang/VaSE) (MIT);
+the TriAttention baseline and the vLLM serving benchmark build on
+[TriAttention](https://github.com/WeianMao/triattention) (Apache-2.0). Exact file-level provenance and the
+diff against upstream are in `docs/PROVENANCE.md`; license texts in `THIRD_PARTY_NOTICES.md`.
+
+## Citation
+
+```bibtex
+@article{randomattention2026,
+  title   = {Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning},
+  year    = {2026}
+}
+```

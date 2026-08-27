@@ -1,0 +1,49 @@
+--- refs/triattention/triattention/vllm/runtime/hook_runtime_context.py	2026-07-08 08:24:07.000000000 +0000
++++ scripts/vllm_rp_bench/shims/hook_runtime_context.py	2026-08-18 07:03:23.000000000 +0000
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -185,6 +187,37 @@
+             )
+ 
+     budget_total = effective_budget_for_signal(config, signal, effective_tokens)
++    # BOUNDARY-ORPHAN FIX (08-18; mechanism confirmed by the DIVIDE_LENGTH=1024 probe,
++    # flag_acc 0.18 -> 0.774 from an 8x event reduction alone): pre-forward (decode)
++    # events compact BEFORE this step's token is written. If cache_len_after fills the
++    # kept blocks exactly (budget % block_size == 0), that token's slot resolves through
++    # a block-table entry beyond the kept prefix — a just-reclaimed block — and its KV
++    # is orphaned when the effective allocator appends a fresh block next step. Keeping
++    # `scheduled` fewer tokens puts cache_len_after + scheduled inside the kept blocks;
++    # every downstream block count (layout validation, scheduler prefix/shrink checks,
++    # worker row sync, effective allocation) is unchanged by construction. Post-forward
++    # (prefill) events already include the chunk in cache_len_after — no reserve needed.
++    # Effective-budget delta: keeps B-1 instead of B per event (-0.05..0.10%, disclosed).
++    # v3 (08-18, specialist diagnosis): ASYNC-GRACE reserve. Worker SELF-TRIGGERED events
++    # bypass the batch-queue boundary barrier, so schedule(S+1) can run with pre-event
++    # allocator state (no effective offset yet, un-truncated manager list -> allocates
++    # nothing) while the worker rows are already truncated. GRACE extra reserved tokens
++    # delay the first block-boundary crossing past that lookahead window. Reserve is
++    # capped at block_size-1 so every downstream block count stays invariant.
++    _grace = int(os.environ.get("TRIATTN_RESERVE_GRACE", "3"))  # queue depth + 1
++    _reserve = (0 if _post_forward else max(1, int(scheduled_tokens))) + _grace
++    _reserve = min(_reserve, 15)
++    # v4b (08-18): a kv_usage event can arrive with budget == the request's CURRENT
++    # length (== prefill_len for a just-prefilled request) — a keep-all no-op by
++    # construction. Reserving below the protected prefill turns that no-op into
++    # prefill_len > budget at the selector -> strict-mode fatal (observed: 690-tok
++    # prompt, budget 690-15=675). A no-op compacts nothing, so it needs no
++    # boundary reserve: skip the reserve rather than break prefill protection.
++    _pf = int(getattr(signal, "prefill_len", 0) or 0)
++    if getattr(config, "protect_prefill", False) and _pf > 0 and budget_total - _reserve < _pf:
++        _reserve = 0
++    if budget_total > _reserve:
++        budget_total -= _reserve
+     local_length_threshold = budget_total + max(1, config.divide_length)
+     length_gate_hit = estimated_effective_tokens >= local_length_threshold
+     kv_override = str(getattr(signal, "reason", "")) == "kv_usage_threshold"

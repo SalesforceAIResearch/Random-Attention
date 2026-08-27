@@ -1,0 +1,16 @@
+--- refs/triattention/triattention/vllm/runtime/runner.py	2026-07-08 08:24:07.000000000 +0000
++++ scripts/vllm_rp_bench/shims/runner.py	2026-08-18 05:49:05.000000000 +0000
+@@ -197,6 +197,13 @@
+                 req_id, actual_kv, effective_kv, scheduled_tokens,
+                 threshold, kv_from_blocks,
+             )
++            # SHIM fix A (08-18): worker self-triggered events bypassed the batch-queue
++            # boundary barrier (the sync keys on scheduler-side signals only), letting
++            # schedule(S+1) run with pre-event allocator state. Set the same same-object
++            # side-channel flag the scheduler-side events use so the queue drains at
++            # self-triggered boundaries too. (The grace reserve in hook_runtime_context
++            # is the guarantee; this is the intent-level fix.)
++            setattr(scheduler_output, "_triattention_force_boundary_sync", True)
+             signals[req_id] = CompressionSignal(
+                 req_id=req_id,
+                 should_compress=True,

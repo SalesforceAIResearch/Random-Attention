@@ -1,0 +1,21 @@
+--- refs/triattention/triattention/vllm/runtime/state.py	2026-07-08 08:24:07.000000000 +0000
++++ scripts/vllm_rp_bench/shims/state.py	2026-08-08 09:23:11.000000000 +0000
+@@ -132,7 +132,17 @@
+             return
+         state.pending_triggers = max(state.pending_triggers - 1, 0)
+         state.last_trigger_reason = f"skipped:{reason}"
+-        state.last_compression_step = step
++        # SHIM (2026-08-08, bookkeeping-only): do NOT set last_compression_step
++        # on a skip.  Its sole consumer is the batch-queue dedup guard
++        # (runner_compression_actions.py:39), whose stated purpose is to avoid
++        # re-executing compression right after an APPLIED step already shrank
++        # the worker block table.  A skip shrinks nothing, so updating the
++        # marker here made every skip arm the guard for the next step, and the
++        # dedup skip re-armed it again -> permanent livelock after the first
++        # under_budget deferral (observed: 1 apply then 27692 dedup skips per
++        # 8192-token decode; cache grew unbounded past the budget).  Same
++        # footgun the upstream NOTE in mark_trigger() already warns about.
++        # Original line: state.last_compression_step = step
+ 
+     def remove(self, req_id: str) -> None:
+         self._states.pop(req_id, None)

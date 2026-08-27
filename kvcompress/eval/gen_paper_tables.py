@@ -1,0 +1,1032 @@
+#!/usr/bin/env python
+# Copyright (c) 2026, Salesforce, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Generate the paper's LaTeX tables from graded results.
+
+Inputs (all read-only):
+  --results   regrade32k_results.tsv   (base  data  method  flag_acc  acc_strict  term_rate  n  runs  warn)
+  --paired    paired_tests_<date>.txt  (stats_paired.py output; sections '== <base> <data>')
+  --lcb       figures/results_lcb.tsv  (model  method  pass1  n)
+  --tp        logs/throughput_vase_protocol.tsv
+  --eff       figures/effective_throughput.md
+  --out       <paper repo>/tables/
+
+Outputs: main_grid.tex, main_grid_strict.tex, appendix_grid.tex, longtrace.tex,
+         mechanism.tex, protection_ablation.tex, efficiency.tex, gpuhours.tex
+
+Design rules (do not weaken):
+  * EXPLICIT cell addressing only — every paper cell resolves through CELL_PREFS +
+    bases_for(); nothing is fuzzy-matched out of the TSV.
+  * n-GATING — a row whose n is not an expected value for the task renders \\pend
+    (partials are never folded). Half-n (8-seed) cells render with a superscript 8.
+  * CAOTE and all quarantined/legacy method strings are never read.
+  * Missing-but-queued cells render \\pend; missing-and-not-planned render --.
+
+With --emit_paired_cmds, prints the stats_paired.py invocations covering exactly the
+cells this script reads (keeps run_paired_headline.sh in sync), and exits.
+"""
+import argparse
+import os
+import re
+import sys
+from collections import defaultdict
+
+# ----------------------------------------------------------------------------- config
+HEADLINE_MODELS = ["Qwen3-4B", "phi-4-reasoning", "Qwen3-32B"]
+APPENDIX_MODELS = ["Qwen3-14B"]   # DeepSeek dropped from the paper (user decision 07-30)
+MODEL_LABEL = {
+    "Qwen3-4B": "Qwen3-4B",
+    "phi-4-reasoning": "Phi-4-reasoning",
+    "Qwen3-32B": "Qwen3-32B",
+    "Qwen3-14B": "Qwen3-14B",
+    "DeepSeek-R1-Distill-Llama-8B": "DeepSeek-R1-Distill-Llama-8B",
+}
+
+# task -> (column header, ~4x budget K, gate2 task-dir stem, data name)
+# "aime" is a POOLED column: aime25+aime26, n-weighted; its data name is the
+# comma-joined list, which stats_paired.py accepts directly (pooled test).
+TASKS = {
+    "math":   ("\\mathfive{}", 1024, "math", "math"),
+    "gpqa":   ("\\gpqa{}",     2048, "gpqa", "gpqa"),
+    "aime":   ("\\aime{}",     4096, "aime", "aime25,aime26"),
+    "hmmt":   ("\\hmmt{}",     4096, "hmmt", "hmmt"),
+    "lcb":    ("\\lcb{}",      3072, None,   None),  # separate grader / TSV
+}
+MAIN_TASK_ORDER = ["math", "gpqa", "aime", "hmmt", "lcb"]
+APPX_TASK_ORDER = ["math", "gpqa", "aime", "hmmt", "lcb"]  # 14B row complete incl. code
+
+# expected n per data name -> superscript marker ("" = the standard full-n cell,
+# None = not acceptable). "8" = 8-seed half cell; "R" = seed-extended cell (all
+# completed seeds pooled; every method in that comparison extended identically).
+EXPECTED_N = {
+    "math":   {1000: "", 500: None},          # 500 = R1, not acceptable
+    "gpqa":   {792: ""},
+    "aime25": {464: "", 232: "8"},
+    "aime26": {480: "", 240: "8"},
+    "hmmt":   {960: "", 480: "8"},
+}
+MARKER_TEX = {"8": "$^{8}$"}
+
+# paper row -> ordered preference of TSV method strings (whitelist; nothing else is read)
+CELL_PREFS = {
+    "dense":     ["dense"],
+    "random_pp": ["random_pp"],
+    "vase":      ["vase_faithful", "range_sink_sample_attn"],
+    "snapkv":    ["attn", "snapkv"],
+    "rkv":       ["attn_rkv_l05", "attn_rkv"],
+    "triattn":   ["triattn_ph_memofix"],  # FAITHFUL scorer ONLY (08-04 fixes). The frozen-policy dirs
+    # (`triattn_ph`) are RETRACTED and must never re-enter a paper table; no fallback on purpose --
+    # a missing memofix cell should surface as a blank, not silently resolve to frozen data.
+}
+ROW_LABEL = {
+    "dense":     "\\dense{}",
+    "random_pp": "\\method{} (ours)",
+    "vase":      "\\vase{}",
+    "snapkv":    "\\snapkv{}",
+    "rkv":       "\\rkv{}",
+    "triattn":   "\\triattn{}",
+}
+MAIN_ROW_ORDER = ["dense", "snapkv", "rkv", "vase", "triattn", "random_pp"]
+
+# known provisional (non-faithful n_large=256 VaSE) cells, faithful re-run in flight
+PROVISIONAL_VASE = set()   # 14B HMMT re-run faithfully at full n (07-30): ledger closed
+
+# cells that are missing AND not queued (render -- instead of \pend)
+NOT_PLANNED = set()   # 14B HMMT dense landed 08-03; grid has no unplanned cells
+
+AUTOGEN = "% AUTO-GENERATED by kvcompress/eval/gen_paper_tables.py -- do not hand-edit.\n"
+
+
+def bases_for(model, task):
+    """Ordered candidate gate2 bases for a (model, main-grid task) cell."""
+    hdr, K, tdir, _ = TASKS[task]
+    out = ["gate2/%s/%s_K%d" % (model, tdir, K)]
+    # 08-16 UNIFIED CONVENTION (Heng): 4x = K4096 for every model. The 07-27 phi relabel's
+    # "~2x-longer traces" premise is refuted by measured generate_lens (phi AIME med 9.2k vs
+    # Qwen3-4B 15.2k) — phi K8192 is the 2x sweep point, not the main cell.
+    if model == "Qwen3-4B" and task == "math":
+        out.append("gate2/Qwen3-4B")  # legacy flat layout
+    return out
+
+
+# ----------------------------------------------------------------------------- inputs
+def load_results(path):
+    rows = {}
+    with open(path) as f:
+        header = f.readline()
+        for ln in f:
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 8 or p[0] == "base":
+                continue
+            base, data, method = p[0], p[1], p[2]
+            try:
+                flag = float(p[3])
+                n = int(p[6])
+            except ValueError:
+                continue  # CORRUPT / ERROR / EMPTY
+            try:
+                strict = float(p[4])
+            except ValueError:
+                strict = None   # flag-only manual row (REPORT-sourced) -> strict cell renders \pend
+            rows[(base, data, method)] = {"flag": flag, "strict": strict, "n": n}
+    return rows
+
+
+def load_lcb(path):
+    rows = {}
+    with open(path) as f:
+        for ln in f:
+            if ln.startswith("#") or ln.startswith("model\t") or not ln.strip():
+                continue
+            model, method, pass1, n = ln.rstrip("\n").split("\t")[:4]
+            rows[(model, method)] = {"flag": float(pass1), "strict": float(pass1), "n": int(n)}
+    return rows
+
+
+def load_paired(path):
+    """{(base, data)ame: {method_b: (delta, starred)}} from stats_paired output."""
+    out = defaultdict(dict)
+    if not path or not os.path.exists(path):
+        return out
+    key = None
+    with open(path) as f:
+        for ln in f:
+            m = re.match(r"^== (\S+) (\S+)", ln)
+            if m:
+                key = (m.group(1), m.group(2))
+                continue
+            if key is None or ln.startswith("B (vs A)") or not ln.strip():
+                continue
+            parts = ln.split()
+            if len(parts) < 6 or "(" in parts[1]:
+                continue  # '(no overlapping problems / missing)'
+            method_b = parts[0]
+            m2 = re.search(r"([+-]\d+\.\d+)\s+\[([^\]]+)\](\*?)", ln)
+            if not m2:
+                continue
+            out[key][method_b] = (float(m2.group(1)), m2.group(3) == "*")
+            if method_b == "range_sink_sample_attn":   # same method, two dir names (vase)
+                out[key].setdefault("vase_faithful", out[key][method_b])
+    return out
+
+
+def load_lcb_paired(pattern="logs/lcb_paired_*.log"):
+    """LCB paired tests (lcb_paired.py output) -> {("lcb", model): {method: (delta, sig)}}.
+    delta = rp - method on the paired problem set; sig = p_boot < 0.05.
+    logs/ is gitignored, so results are archived in figures/lcb_paired_*.txt (tracked)."""
+    import glob
+    out = defaultdict(dict)
+    for path in sorted(glob.glob(pattern)) + sorted(glob.glob("figures/lcb_paired_*.txt")):
+        model = None
+        for ln in open(path):
+            m = re.match(r"^# lcb-paired gate2/([^/]+)/", ln)
+            if m:
+                model = m.group(1)
+                continue
+            if model is None or ln.startswith("B (vs A)"):
+                continue
+            m2 = re.match(r"^(\S+)\s+\d+\s+[\d.]+\s+[\d.]+\s+([+-][\d.]+)\s+\[[^\]]+\]\s+([\d.]+)", ln)
+            if m2:
+                out[("lcb", model)][m2.group(1)] = (float(m2.group(2)), float(m2.group(3)) < 0.05)
+    return out
+
+
+def load_throughput(path):
+    """Last valid row wins: {(method, output_len): (tok_s, peak_GB)}."""
+    rows = {}
+    with open(path) as f:
+        f.readline()
+        for ln in f:
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 5 or p[3].startswith("ERR"):
+                continue
+            try:
+                rows[(p[0], int(p[1]))] = (float(p[3]), float(p[4]))
+            except ValueError:
+                continue
+    return rows
+
+
+def load_vllm(path):
+    """{(model, point, method): value} from figures/results_vllm.tsv (metric column ignored)."""
+    out = {}
+    with open(path) as f:
+        for ln in f:
+            if ln.startswith("#") or ln.startswith("model\t"):
+                continue
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 5:
+                continue
+            try:
+                out[(p[0], p[1], p[2])] = float(p[4])
+            except ValueError:
+                continue
+    return out
+
+
+def load_isomem(path):
+    """{(model, output_len, method): (max_batch, tok_s, peak_GB)} from figures/results_isomem.tsv."""
+    out = {}
+    with open(path) as f:
+        for ln in f:
+            if ln.startswith("#") or ln.startswith("model\t"):
+                continue
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 6:
+                continue
+            try:
+                out[(p[0], int(p[1]), p[2])] = (int(p[3]), float(p[4]), float(p[5]))
+            except ValueError:
+                continue
+    return out
+
+
+def load_evictcost(path):
+    """{(model, method): (ms_per_call, pct_of_decode)} from figures/results_evictcost.tsv."""
+    out = {}
+    with open(path) as f:
+        for ln in f:
+            if ln.startswith("#") or ln.startswith("model\t"):
+                continue
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 4:
+                continue
+            try:
+                out[(p[0], p[1])] = (float(p[2]), float(p[3]))
+            except ValueError:
+                continue
+    return out
+
+
+def load_eff_md(path):
+    """{(task, method): correct/GPU-h} from effective_throughput.md (generated file)."""
+    out = {}
+    with open(path) as f:
+        for ln in f:
+            m = re.match(r"\|\s*(\w+)\s*\|\s*([\w_]+)\s*\|.*\*\*([\d.]+)\*\*\s*\|\s*$", ln)
+            if m:
+                out[(m.group(1), m.group(2))] = float(m.group(3))
+    return out
+
+
+# ----------------------------------------------------------------------------- resolve
+class Cell:
+    def __init__(self, val=None, marker="", pend=False, dash=False):
+        self.val, self.marker, self.pend, self.dash = val, marker, pend, dash
+
+
+def resolve(results, lcb, model, task, row, metric="flag"):
+    """Resolve one main/appendix-grid cell -> (Cell, resolved (base, data, method) or None).
+
+    A pooled task (data name = comma list, e.g. aime25,aime26) requires EVERY
+    component dataset at an expected n under the SAME method string; the value is
+    the n-weighted mean and the ^8 marker appears if any component is 8-seed.
+    """
+    if (model, task, row) in NOT_PLANNED:
+        return Cell(dash=True), None
+    if task == "lcb":
+        for meth in CELL_PREFS[row]:
+            hit = lcb.get((model, meth))
+            if hit:
+                return Cell(hit[metric if metric in hit else "flag"]), (None, None, meth)
+        return Cell(pend=True), None
+    _, _, _, data = TASKS[task]
+    datas = data.split(",")
+    for base in bases_for(model, task):
+        for meth in CELL_PREFS[row]:
+            tot_n, tot_v, marks = 0, 0.0, set()
+            ok = True
+            for d in datas:
+                hit = results.get((base, d, meth))
+                if hit is None:
+                    ok = False
+                    break
+                mark = EXPECTED_N[d].get(hit["n"])
+                if mark is None:
+                    sys.stderr.write("WARN partial/odd n=%d skipped: %s %s %s\n"
+                                     % (hit["n"], base, d, meth))
+                    ok = False
+                    break
+                if mark:
+                    marks.add(mark)
+                if hit[metric] is None:       # flag-only manual row: no strict value yet
+                    ok = False
+                    break
+                tot_n += hit["n"]
+                tot_v += hit[metric] * hit["n"]
+            if not ok or not tot_n:
+                continue
+            marker = "".join(MARKER_TEX[m] for m in sorted(marks))
+            if row == "vase" and (model, task) in PROVISIONAL_VASE \
+               and meth == "range_sink_sample_attn":
+                marker += "$^{\\mathrm{n}}$"
+            return Cell(tot_v / tot_n, marker), (base, data, meth)
+    return Cell(pend=True), None
+
+
+def gated(results, base, data, meth, n_full, tol=1.0):
+    """Full-n-gated lookup: returns flag_acc or None. tol<1 allows a near-complete cell."""
+    hit = results.get((base, data, meth))
+    if hit is None or hit["n"] < tol * n_full or hit["n"] > n_full:
+        return None
+    return hit["flag"]
+
+
+def fmt(cell, bold=False, sig="", gray=False):
+    if cell.pend:
+        return "\\pend{}"
+    if cell.dash or cell.val is None:
+        return "--"
+    s = "%.3f" % cell.val
+    if bold:
+        s = "\\best{%s}" % s
+    s += cell.marker + sig
+    if gray:
+        s = "\\sigbelow{%s}" % s
+    return s
+
+
+# ----------------------------------------------------------------------------- tables
+def grid_table(results, lcb, paired, models, task_order, metric, label, caption,
+               rows=MAIN_ROW_ORDER):
+    disp = lambda v: round(v, 3)  # ties are judged at DISPLAY precision
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\footnotesize",
+             "\\setlength{\\tabcolsep}{3.5pt}",
+             "\\caption{%s}" % caption, "\\label{%s}" % label,
+             "\\resizebox{\\textwidth}{!}{%",
+             "\\begin{tabular}{l%sc}" % ("c" * len(task_order)), "\\toprule"]
+    hdr = [""] + [TASKS[t][0] for t in task_order] + ["Avg"]
+    sub = [""] + ["\\scriptsize $K{=}%d$" % TASKS[t][1] for t in task_order] + [""]
+    lines.append(" & ".join(hdr) + " \\\\")
+    lines.append(" & ".join(sub) + " \\\\")
+    for model in models:
+        lines.append("\\midrule")
+        lines.append("\\rowcolor{black!7}")
+        lines.append("\\multicolumn{%d}{l}{\\textbf{%s}} \\\\" % (len(task_order) + 2, MODEL_LABEL[model]))
+        cells, resolved = {}, {}
+        for row in rows:
+            for t in task_order:
+                cells[(row, t)], resolved[(row, t)] = resolve(results, lcb, model, t, row, metric)
+        # row average: unweighted mean over task columns, only for COMPLETE rows
+        avg_val = {}
+        for row in rows:
+            cs = [cells[(row, t)] for t in task_order]
+            if any(c.dash for c in cs):
+                avg_val[row] = "dash"
+            elif any(c.pend or c.val is None for c in cs):
+                avg_val[row] = None
+            else:
+                avg_val[row] = sum(c.val for c in cs) / len(cs)
+        # best eviction method per column (dense excluded, pend excluded);
+        # every row that TIES the best at display precision is bolded
+        best = {}
+        for t in task_order:
+            vals = [disp(cells[(r, t)].val) for r in rows
+                    if r != "dense" and not cells[(r, t)].pend and cells[(r, t)].val is not None]
+            if vals:
+                best[t] = max(vals)
+        avg_best = max((disp(v) for r, v in avg_val.items()
+                        if r != "dense" and isinstance(v, float)), default=None)
+        for row in rows:
+            out = [ROW_LABEL[row]]
+            for t in task_order:
+                # gray-out: baseline significantly BELOW random_pp under the
+                # paired test (delta = rp - method > 0, starred). The rare
+                # significant baseline win stays black and is stated in prose.
+                gray, up = False, ""
+                if row not in ("dense", "random_pp") and resolved[(row, t)]:
+                    base, data, meth = resolved[(row, t)]
+                    if t == "lcb":   # LCB pairs come from lcb_paired.py logs
+                        d = paired.get(("lcb", model), {}).get(meth)
+                    else:
+                        d = paired.get((base, data), {}).get(meth)
+                        if d is None:   # marker may be keyed to an alternate base layout
+                            for b_ in bases_for(model, t):
+                                d = paired.get((b_, data), {}).get(meth)
+                                if d:
+                                    break
+                    gray = bool(d and d[1] and d[0] > 0)
+                    # the rare significant baseline win over \method is stated in prose, not marked
+                    up = ""
+                c = cells[(row, t)]
+                bold = (row != "dense" and not c.pend and c.val is not None
+                        and best.get(t) == disp(c.val))
+                out.append(fmt(c, bold=bold, sig=up, gray=gray))
+            v = avg_val[row]
+            if v == "dash":
+                out.append("--")
+            elif v is None:
+                out.append("\\pend{}")
+            else:
+                s = "%.3f" % v
+                if row != "dense" and avg_best is not None and disp(v) == avg_best:
+                    s = "\\best{%s}" % s
+                out.append(s)
+            if row == "random_pp":
+                lines.append("\\rowcolor{oursbg}")
+            lines.append(" & ".join(out) + " \\\\")
+            if row == "dense":
+                lines.append("\\cmidrule(lr){1-%d}" % (len(task_order) + 2))
+    lines += ["\\bottomrule", "\\end{tabular}}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+REGIME_TSV = "figures/results_regime_4b_phi.tsv"   # same file that draws the regime figure
+
+
+def longtrace_table(results):
+    # Sourced from the regime-map TSV (pooled AIME rows, full n) so the table and
+    # Figure regime always agree. 08-16 unified convention: x = 16384/K for every
+    # model (the 07-27 trace-relative phi labels are retired; TSV keyed by K, not label).
+    rows_ = {}
+    with open(REGIME_TSV) as f:
+        f.readline()
+        for ln in f:
+            p = ln.rstrip("\n").split("\t")
+            if len(p) >= 6:
+                rows_[(p[0], p[1], int(p[3]), p[4])] = float(p[5])
+    SPEC = [("Qwen3-4B", "aime", "8x", 2048), ("Qwen3-4B", "aime", "16x", 1024),
+            ("Qwen3-4B", "hmmt", "8x", 2048), ("Qwen3-4B", "hmmt", "16x", 1024),
+            ("phi-4-reasoning", "aime", "8x", 2048), ("phi-4-reasoning", "aime", "16x", 1024),
+            ("phi-4-reasoning", "hmmt", "8x", 2048), ("phi-4-reasoning", "hmmt", "16x", 1024)]
+    COLS = ["random_pp", "vase_faithful", "triattn_ph_memofix"]  # faithful only; see method map note
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\small",
+             "\\caption{Long-trace boundary: accuracy at 8$\\times$--32$\\times$ compression on "
+             "competition math (AIME pools 2025+2026, $n$-weighted; Phi-4's compression is "
+             "trace-relative --- its traces are ${\\sim}2\\times$ longer). \\method{} leads or "
+             "ties every cell, by up to $+22.2$pp over \\vase{}; bold marks the best value in "
+             "a row, shared where the leaders tie at this precision.}",
+             "\\label{tab:longtrace}",
+             "\\begin{tabular}{llcccc}", "\\toprule",
+             "Model & Task & Compr. & \\method{} & \\vase{} & \\triattn{} \\\\", "\\midrule"]
+    for model, tstem, comp, K in SPEC:
+        vals = [rows_.get((model, tstem, K, m)) for m in COLS]
+        pretty = [("\\pend{}" if v is None else "%.3f" % v) for v in vals]
+        nums = [round(v, 3) for v in vals if v is not None]
+        # bold every column that ties the row best at display precision (house rule)
+        for j, v in enumerate(vals):
+            if nums and v is not None and round(v, 3) == max(nums):
+                pretty[j] = "\\best{%s}" % pretty[j]
+        lines.append("%s & %s & %s$\\times$ ($K{=}%d$) & %s \\\\"
+                     % (MODEL_LABEL[model], "AIME" if tstem == "aime" else "\\hmmt{}",
+                        comp[:-1], K, " & ".join(pretty)))
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def mechanism_table(results):
+    # columns: (model, task, K); rows: protection x filler policy
+    COLS = [("Qwen3-4B", "math", 1024), ("Qwen3-4B", "gpqa", 2048), ("phi-4-reasoning", "math", 1024)]
+    ROWS = [("\\dense{}", ["dense"]),
+            ("\\method{} (ours)", ["random_pp"]),
+            ("Prompt + recency window", ["recency_pp"])]
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\footnotesize",
+             "\\caption{What the scatter is worth as a filler, at $4\\times$ compression (flag "
+             "accuracy). All rows keep the prompt and differ only in how the remaining budget "
+             "is spent: a uniform per-head scatter of the history, or the contiguous most-recent "
+             "window.}",
+             "\\label{tab:mechanism}",
+             "\\begin{tabular}{lccc}", "\\toprule",
+             "Policy & 4B \\mathfive{} & 4B \\gpqa{} & Phi-4 \\mathfive{} \\\\",
+             "\\midrule"]
+    N_FULL = {"math": 1000, "gpqa": 792}
+    for label, prefs in ROWS:
+        out = [label]
+        for model, task, K in COLS:
+            v = None
+            # controls exist only for 4B MATH (legacy layout); tol 0.98 = the n=996 recency cell
+            tol = 0.98 if prefs[0] in ("random", "recency") else 1.0
+            for base in bases_for(model, task):
+                for meth in prefs:
+                    v = gated(results, base, TASKS[task][3], meth, N_FULL[task], tol)
+                    if v is not None:
+                        break
+                if v is not None:
+                    break
+            out.append("--" if v is None else "%.3f" % v)
+        lines.append(" & ".join(out) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def protection_table(results):
+    KS = [(2048, 2), (1024, 4), (512, 8), (256, 16)]
+    COLS = [("\\method{}", ["random_pp"]),
+            ("\\vase{}\\,+\\,prompt", ["range_sink_sample_attn_pp"]),
+            ("Shared scatter", ["random_unified"])]
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\footnotesize",
+             "\\caption{Matched-protection comparison (Qwen3-4B, \\mathfive{}, flag accuracy): "
+             "every column keeps the prompt; columns differ only in how the remaining budget is "
+             "filled --- uniform per-head scatter, \\vase{}'s ranking, or a single scatter shared "
+             "across heads.}",
+             "\\label{tab:protection}",
+             "\\begin{tabular}{lccc}", "\\toprule",
+             "Budget & " + " & ".join(l for l, _ in COLS) + " \\\\", "\\midrule"]
+    # random_unified was only run at 4x/8x/16x -> K2048 renders --; partial/queued cells render \pend
+    NEVER_RUN = {(2048, "random_unified")}
+    for K, comp in KS:
+        base = "gate2/Qwen3-4B/math_K%d" % K
+        out = ["$K{=}%d$ (%d$\\times$)" % (K, comp)]
+        vals, pends = [], []
+        for _, prefs in COLS:
+            v = None
+            for meth in prefs:
+                v = gated(results, base, "math", meth, 1000)
+                if v is None and K == 1024:
+                    v = gated(results, "gate2/Qwen3-4B", "math", meth, 1000)
+                if v is not None:
+                    break
+            vals.append(v)
+            pends.append(not any((K, m) in NEVER_RUN for m in prefs))
+        mx = max((round(v, 3) for v in vals if v is not None), default=None)
+        for v, is_pend in zip(vals, pends):
+            if v is None:
+                out.append("\\pend{}" if is_pend else "--")
+            else:
+                s = "%.3f" % v
+                out.append("\\best{%s}" % s if round(v, 3) == mx else s)
+        lines.append(" & ".join(out) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def promptprotect_table(results):
+    """Every method with and without the prompt-protection rule (two models x two tasks).
+
+    Columns are (task, protected?) pairs; rows are the three learned selectors that ship
+    without the rule plus the two signal-free policies. The protected cell carries the gain
+    from the rule as a small coloured number (red when >= 2 points); the best protected
+    method per panel is bold; the \\method row is tinted. TriAttention is deliberately
+    absent: it protects the whole input by default, so it has no unprotected twin.
+    """
+    # (column label, base, data, n_full, extra fallback bases)
+    TASKS = [("\\mathfive{}", "gate2/Qwen3-4B/math_K1024", "math", 1000, ["gate2/Qwen3-4B"]),
+             ("\\gpqa{}", "gate2/Qwen3-4B/gpqa_K2048", "gpqa", 792, []),
+             ("\\mathfive{}", "gate2/phi-4-reasoning/math_K1024", "math", 1000, []),
+             ("\\gpqa{}", "gate2/phi-4-reasoning/gpqa_K2048", "gpqa", 792, [])]
+    GROUPS = [("Qwen3-4B", 2), ("Phi-4-reasoning", 2)]
+    # (label, unprotected methods, protected methods, n-tolerance)
+    ROWS = [("\\snapkv{}", ["attn"], ["attn_pp"], 0.99),
+            ("\\rkv{}", ["attn_rkv_l05"], ["attn_rkv_pp"], 0.99),
+            ("\\vase{}", ["vase_faithful", "range_sink_sample_attn"],
+             ["range_sink_sample_attn_pp", "vase_pp"], 0.99),
+            (None, None, None, None),
+            ("Recency window", ["recency"], ["recency_pp"], 0.99),
+            ("\\method{}", ["random"], ["random_pp"], 0.99)]
+
+    def lookup(prefs, base, fbs, data, n_full, tol):
+        for meth in prefs:
+            for b in [base] + fbs:
+                v = gated(results, b, data, meth, n_full, tol=tol)
+                if v is not None:
+                    return v
+        return None
+
+    # resolve every cell first so the best protected value per panel is known
+    V = {}
+    for label, plain, prot, tol in ROWS:
+        if label is None:
+            continue
+        for ti, (_, base, data, n_full, fbs) in enumerate(TASKS):
+            V[(label, ti, "plain")] = lookup(plain, base, fbs, data, n_full, tol)
+            V[(label, ti, "prot")] = lookup(prot, base, fbs, data, n_full, tol)
+    best_prot = {}
+    for ti in range(len(TASKS)):
+        vals = [round(V[(lab, ti, "prot")], 3) for lab, *_ in ROWS
+                if lab is not None and V.get((lab, ti, "prot")) is not None]
+        best_prot[ti] = max(vals) if vals else None
+
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\small",
+             "\\setlength{\\tabcolsep}{4pt}",
+             "\\caption{Every method with and without the rule that protects the prompt "
+             "(flag accuracy; budgets $1024$ on \\mathfive{}, $2048$ on \\gpqa{}). Small "
+             "numbers give the gain from the rule in points, \\gain{red} when at least "
+             "$2$; bold marks the best protected method in each setting. The rule pays "
+             "according to how much of the question a score was losing: \\rkv{} never "
+             "gains more than $1.9$ points, \\snapkv{} gains everywhere, \\vase{} gains "
+             "materially only on Phi-4-reasoning.}",
+             "\\label{tab:promptprotect}",
+             "\\resizebox{\\textwidth}{!}{%",
+             "\\begin{tabular}{l" + "cc" * len(TASKS) + "}", "\\toprule"]
+    cells = ["\\multicolumn{%d}{c}{%s}" % (2 * span, glbl) for glbl, span in GROUPS]
+    lines.append(" & " + " & ".join(cells) + " \\\\")
+    rules, start = [], 2
+    for _, span in GROUPS:
+        rules.append("\\cmidrule(lr){%d-%d}" % (start, start + 2 * span - 1))
+        start += 2 * span
+    lines.append(" ".join(rules))
+    lines.append(" & " + " & ".join("\\multicolumn{2}{c}{%s}" % t for t, _, _, _, _ in TASKS) + " \\\\")
+    lines.append(" ".join("\\cmidrule(lr){%d-%d}" % (2 + 2 * i, 3 + 2 * i) for i in range(len(TASKS))))
+    lines += ["Method & " + " & ".join(["score alone", "$+$ prompt"] * len(TASKS)) + " \\\\",
+              "\\midrule"]
+    for label, plain, prot, tol in ROWS:
+        if label is None:
+            lines.append("\\midrule")
+            continue
+        cells = []
+        for ti in range(len(TASKS)):
+            vp, vq = V[(label, ti, "plain")], V[(label, ti, "prot")]
+            cells.append("--" if vp is None else "%.3f" % vp)
+            if vq is None:
+                cells.append("--")
+                continue
+            body = "%.3f" % vq
+            if best_prot[ti] is not None and round(vq, 3) == best_prot[ti]:
+                body = "\\best{%s}" % body
+            if vp is not None:
+                g = 100 * (vq - vp)
+                mac = "\\gain" if g >= 2.0 else "\\gainnull"
+                body += "\\,%s{%+.1f}" % (mac, g)
+            cells.append(body)
+        pre = "\\rowcolor{oursbg} " if label == "\\method{}" else ""
+        lines.append(pre + label + " & " + " & ".join(cells) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def promptprotect_appendix_table(results, lcb):
+    """Matched protection on the panels Table 2 does not cover (appendix).
+
+    Panels: Qwen3-4B LCB / AIME (pooled) / HMMT, Phi-4-reasoning LCB, Qwen3-32B GPQA.
+    Rows: the three selectors that ship without the rule (score alone -> + prompt, with the
+    gain as a small number), then TriAttention and \\method, which keep the prompt by
+    construction and therefore appear only in the protected column. Bold = best protected
+    value per panel. LCB values come from results_lcb.tsv (pass@1); the rest from the
+    flag-accuracy TSV at full n, AIME n-weighted over 2025+2026.
+    """
+    # (label, kind, key) ; kind "lcb" -> lcb[(model, meth)], kind "res" -> (base, [(data, n_full)])
+    PANELS = [("\\lcb{}", "lcb", "Qwen3-4B"),
+              ("\\aime{}", "res", ("gate2/Qwen3-4B/aime_K4096", [("aime25", 464), ("aime26", 480)])),
+              ("\\hmmt{}", "res", ("gate2/Qwen3-4B/hmmt_K4096", [("hmmt", 960)])),
+              ("\\lcb{}", "lcb", "phi-4-reasoning"),
+              ("\\gpqa{}", "res", ("gate2/Qwen3-32B/gpqa_K2048", [("gpqa", 792)]))]
+    GROUPS = [("Qwen3-4B", 3), ("Phi-4-reasoning", 1), ("Qwen3-32B", 1)]
+    ROWS = [("\\snapkv{}", ["attn"], ["attn_pp"]),
+            ("\\rkv{}", ["attn_rkv_l05"], ["attn_rkv_pp"]),
+            ("\\vase{}", ["vase_faithful", "range_sink_sample_attn"],
+             ["vase_pp", "range_sink_sample_attn_pp"]),
+            (None, None, None),
+            ("\\triattn{}", [], ["triattn_ph_memofix"]),
+            ("\\method{}", [], ["random_pp"])]
+
+    def lookup(prefs, kind, key):
+        for meth in prefs:
+            if kind == "lcb":
+                hit = lcb.get((key, meth))
+                if hit:
+                    return hit["flag"]
+            else:
+                base, datas = key
+                tot_n, tot_v, ok = 0, 0.0, True
+                for d, n_full in datas:
+                    hit = results.get((base, d, meth))
+                    if hit is None or hit["n"] != n_full:
+                        ok = False
+                        break
+                    tot_n += hit["n"]; tot_v += hit["flag"] * hit["n"]
+                if ok and tot_n:
+                    return tot_v / tot_n
+        return None
+
+    # Reference rows PINNED to Table 1 (tab:main, hand-maintained): the faithful tri
+    # (memofix) rows for 32B GPQA / 4B AIME / 4B HMMT live only in the same-day sweep behind
+    # Table 1, and the LCB TSV's rp/tri values differ from Table 1 by <1.5pp (different
+    # grading pass). Pinning keeps the appendix consistent with the main grid, as Table 2
+    # pins phi GPQA rp. Panel order: 4B LCB, 4B AIME, 4B HMMT, phi LCB, 32B GPQA.
+    REF_TABLE1 = {"\\triattn{}": [0.755, 0.602, 0.437, 0.652, 0.683],
+                  "\\method{}":  [0.744, 0.621, 0.438, 0.667, 0.683]}
+    V = {}
+    for label, plain, prot in ROWS:
+        if label is None:
+            continue
+        for pi, (_, kind, key) in enumerate(PANELS):
+            V[(label, pi, "plain")] = lookup(plain, kind, key)
+            V[(label, pi, "prot")] = (REF_TABLE1[label][pi] if label in REF_TABLE1
+                                      else lookup(prot, kind, key))
+    best_prot = {}
+    for pi in range(len(PANELS)):
+        vals = [round(V[(lab, pi, "prot")], 3) for lab, *_ in ROWS
+                if lab is not None and V.get((lab, pi, "prot")) is not None]
+        best_prot[pi] = max(vals) if vals else None
+
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\small",
+             "\\setlength{\\tabcolsep}{3pt}",
+             "\\caption{Matched protection in the settings Table~\\ref{tab:promptprotect} does "
+             "not cover (\\lcb{}: pass@1; others: flag accuracy; \\aime{} pools 2025+2026). "
+             "Small numbers give the gain from the rule in points, \\gain{red} when at least "
+             "$2$; bold marks the best protected method in each setting. \\triattn{} and "
+             "\\method{} keep the prompt by construction and appear only in the protected "
+             "column (values as in Table~\\ref{tab:main}); \\vase{} is not below "
+             "\\method{} on \\aime{} or \\hmmt{} unprotected, so the rule was not "
+             "applied there.}",
+             "\\label{tab:promptprotect_appx}",
+             "\\resizebox{\\textwidth}{!}{%",
+             "\\begin{tabular}{l" + "cc" * len(PANELS) + "}", "\\toprule"]
+    cells = ["\\multicolumn{%d}{c}{%s}" % (2 * span, g) for g, span in GROUPS]
+    lines.append(" & " + " & ".join(cells) + " \\\\")
+    rules, start = [], 2
+    for _, span in GROUPS:
+        rules.append("\\cmidrule(lr){%d-%d}" % (start, start + 2 * span - 1)); start += 2 * span
+    lines.append(" ".join(rules))
+    lines.append(" & " + " & ".join("\\multicolumn{2}{c}{%s}" % t for t, _, _ in PANELS) + " \\\\")
+    lines.append(" ".join("\\cmidrule(lr){%d-%d}" % (2 + 2 * i, 3 + 2 * i) for i in range(len(PANELS))))
+    lines += ["Method & " + " & ".join(["score alone", "$+$ prompt"] * len(PANELS)) + " \\\\",
+              "\\midrule"]
+    for label, plain, prot in ROWS:
+        if label is None:
+            lines.append("\\midrule"); continue
+        cells = []
+        for pi in range(len(PANELS)):
+            vp, vq = V[(label, pi, "plain")], V[(label, pi, "prot")]
+            cells.append("--" if vp is None else "%.3f" % vp)
+            if vq is None:
+                cells.append("--"); continue
+            body = "%.3f" % vq
+            if best_prot[pi] is not None and round(vq, 3) == best_prot[pi]:
+                body = "\\best{%s}" % body
+            if vp is not None:
+                g = 100 * (vq - vp)
+                body += "\\,%s{%+.1f}" % ("\\gain" if g >= 2.0 else "\\gainnull", g)
+            cells.append(body)
+        pre = "\\rowcolor{oursbg} " if label == "\\method{}" else ""
+        lines.append(pre + label + " & " + " & ".join(cells) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def efficiency_table(tp):
+    METHODS = [("dense", "\\dense{}"), ("snapkv", "\\snapkv{}"), ("rkv", "\\rkv{}"),
+               ("vase", "\\vase{}"), ("triattn", "\\triattn{}"), ("random_pp", "\\method{} (ours)")]
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\small",
+             "\\caption{Decode throughput and peak memory at a fixed batch of 16 with "
+             "$K{=}1024$ on one H200 (Qwen3-4B), following \\vase{}'s released benchmark. "
+             "\\method{} needs no scoring pass and is the fastest evictor; at 32k outputs "
+             "eviction gives $3.1\\times$ full-attention throughput in $7.7\\times$ less memory.}",
+             "\\label{tab:efficiency}",
+             "\\begin{tabular}{lccc}", "\\toprule",
+             "Method & tok/s @16k & tok/s @32k & Peak GB @32k \\\\", "\\midrule"]
+    best16 = max((round(tp[(m, 16384)][0]) for m, _ in METHODS if (m, 16384) in tp and m != "dense"), default=None)
+    best32 = max((round(tp[(m, 32768)][0]) for m, _ in METHODS if (m, 32768) in tp and m != "dense"), default=None)
+    for m, label in METHODS:
+        r16, r32 = tp.get((m, 16384)), tp.get((m, 32768))
+        if r16 is None and r32 is None and m == "rkv":
+            lines.append("%s & \\pend{} & \\pend{} & \\pend{} \\\\" % label)
+            continue
+        if r16 is None and r32 is None:
+            continue
+        c16 = "--" if r16 is None else ("\\best{%.0f}" % r16[0] if m != "dense" and round(r16[0]) == best16 else "%.0f" % r16[0])
+        c32 = "--" if r32 is None else ("\\best{%.0f}" % r32[0] if m != "dense" and round(r32[0]) == best32 else "%.0f" % r32[0])
+        gb = "--" if r32 is None else "%.1f" % r32[1]
+        lines.append("%s & %s & %s & %s \\\\" % (label, c16, c32, gb))
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def gpuhours_table(eff):
+    TASK_COLS = [("math", "\\mathfive{}"), ("gpqa", "\\gpqa{}"), ("aime", "\\aime{}"), ("hmmt", "\\hmmt{}")]
+    METHODS = [("dense", "\\dense{}"), ("snapkv", "\\snapkv{}"), ("vase", "\\vase{}"),
+               ("triattn", "\\triattn{}"), ("random_pp", "\\method{} (ours)")]
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\small",
+             "\\caption{Correct answers per GPU-hour (Qwen3-4B, 4$\\times$ budgets): accuracy "
+             "$\\times$ measured decode speed $\\div$ measured generation length. \\method{} is "
+             "the most efficient method on every task.}",
+             "\\label{tab:gpuhours}",
+             "\\begin{tabular}{lcccc}", "\\toprule",
+             "Method & " + " & ".join(l for _, l in TASK_COLS) + " \\\\", "\\midrule"]
+    best = {t: max((round(eff[(t, m)], 1) for m, _ in METHODS if (t, m) in eff), default=None)
+            for t, _ in TASK_COLS}
+    for m, label in METHODS:
+        out = [label]
+        for t, _ in TASK_COLS:
+            v = eff.get((t, m))
+            if v is None:
+                out.append("--")
+            else:
+                out.append("\\best{%.1f}" % v if round(v, 1) == best[t] else "%.1f" % v)
+        lines.append(" & ".join(out) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def vllm_table(v):
+    """Serving throughput inside TriAttention's own vLLM runtime: the 32k long-decode point on
+    three models (the 8k short-decode point is reported in the appendix)."""
+    # 08-27: Phi-4-reasoning column added (primary model; parameter order 4B < phi 14.7B <
+    # 14B 14.8B < 32B). Caption synced to Heng's Overleaf-trimmed caption (d4f1076) plus the
+    # one phi-specific caveat: its 32k context caps the generation at 31.5k tokens.
+    MODELS = [("Qwen3-4B", "Qwen3-4B"), ("phi-4-reasoning", "Phi-4-reasoning"),
+              ("Qwen3-14B", "Qwen3-14B"), ("Qwen3-32B", "Qwen3-32B")]
+    PK = "out32k"
+    ROWS = [("dense", "\\dense{}"), ("triattn", "\\triattn{}"),
+            ("random_pp", "\\method{} (ours)")]
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\small",
+             "\\setlength{\\tabcolsep}{6pt}",
+             "\\caption{Serving throughput (output tok/s, and the multiple of full "
+             "attention) under vLLM with PagedAttention on one H200. Phi-4-reasoning "
+             "generates $31.5$k tokens, the most its $32$k context allows.}",
+             "\\label{tab:vllm}",
+             "\\begin{tabular}{l" + "c" * len(MODELS) + "}", "\\toprule",
+             "Method & " + " & ".join(lbl for _, lbl in MODELS) + " \\\\", "\\midrule"]
+    for m, label in ROWS:
+        cells = []
+        for mk, _ in MODELS:
+            val, den = v.get((mk, PK, m)), v.get((mk, PK, "dense"))
+            if val is None or den is None:
+                cells.append("--")
+                continue
+            body = "%.0f\\,($%.2f\\times$)" % (val, val / den)
+            cells.append("\\best{%s}" % body if m == "random_pp" else body)
+        pre = "\\rowcolor{oursbg} " if m == "random_pp" else ""
+        lines.append(pre + label + " & " + " & ".join(cells) + " \\\\")
+    lines.append("\\midrule")
+    gains = []
+    for mk, _ in MODELS:
+        a, b = v.get((mk, PK, "random_pp")), v.get((mk, PK, "triattn"))
+        gains.append("--" if a is None or b is None else "$+%.0f\\%%$" % (100 * (a / b - 1)))
+    lines += ["\\rowcolor{oursbg} \\emph{ours over \\triattn{}} & " + " & ".join(gains) + " \\\\",
+              "\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def isomem_table(m, out_len=32768):
+    """Equal-memory serving: each method at its largest fitting batch, both models."""
+    MODELS = ["Qwen3-4B", "Qwen3-14B"]
+    ROWS = [("dense", "\\dense{} (no eviction)"), ("snapkv", "\\snapkv{}"), ("rkv", "\\rkv{}"),
+            ("vase", "\\vase{}"), ("triattn", "\\triattn{}"), ("random_pp", "\\method{} (ours)")]
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\small",
+             "\\setlength{\\tabcolsep}{5pt}",
+             "\\caption{Serving throughput when each method runs at the largest batch that "
+             "fits one $143$\\,GB H200, at $\\budget{=}3072$ with $32$k generations. The "
+             "small cache is what buys the batch, so every evictor collects most of the "
+             "win; the ordering among them follows the cost of their scoring pass. "
+             "\\textbf{The \\triattn{} row is an unfused re-implementation of its scorer, "
+             "far slower than the authors' kernels, on which the gap to \\method{} on these "
+             "two models is $1.4\\times$, not $2.7$--$3.0\\times$ "
+             "(Table~\\ref{tab:vllm}).} Every other row runs on one shared code path.}",
+             "\\label{tab:isomem}",
+             "\\begin{tabular}{l" + "ccc" * len(MODELS) + "}", "\\toprule",
+             " & " + " & ".join("\\multicolumn{3}{c}{%s}" % s for s in MODELS) + " \\\\"]
+    lines.append(" ".join("\\cmidrule(lr){%d-%d}" % (2 + 3 * i, 4 + 3 * i) for i in range(len(MODELS))))
+    lines += ["Method & " + " & ".join(["batch", "tok/s", "$\\times$\\,full"] * len(MODELS)) + " \\\\",
+              "\\midrule"]
+    for meth, label in ROWS:
+        cells = []
+        for mk in MODELS:
+            r, den = m.get((mk, out_len, meth)), m.get((mk, out_len, "dense"))
+            if r is None or den is None:
+                cells += ["--", "--", "--"]
+                continue
+            best = meth == "random_pp"
+            cells += ["%d" % r[0],
+                      "\\best{%.0f}" % r[1] if best else "%.0f" % r[1],
+                      "\\best{%.2f}" % (r[1] / den[1]) if best else "%.2f" % (r[1] / den[1])]
+        pre = "\\rowcolor{oursbg} " if meth == "random_pp" else ""
+        lines.append(pre + label + " & " + " & ".join(cells) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def evictcost_table(c):
+    """Per-eviction-round wall-clock, single stream, both models."""
+    MODELS = ["Qwen3-4B", "Qwen3-14B"]
+    ROWS = [("random_pp", "\\method{} (ours)"), ("snapkv", "\\snapkv{}"),
+            ("rkv", "\\rkv{}"), ("vase", "\\vase{}"), ("triattn", "\\triattn{}")]
+    lines = [AUTOGEN, "\\begin{table}[t]", "\\centering", "\\small",
+             "\\caption{Cost of one eviction round (scoring $+$ compaction), measured with "
+             "CUDA events on an otherwise idle H200: $\\budget{=}1024$, $4096$ decode steps, "
+             "single stream. \\method{} performs no scoring, so its round time is the "
+             "compaction floor every evictor pays; the excess over it is the price of the "
+             "selection signal. The ordering, and the per-call costs to within $12\\%$, are "
+             "unchanged across a $3.5\\times$ change in model size.}",
+             "\\label{tab:evictcost}",
+             "\\begin{tabular}{lcccc}", "\\toprule",
+             " & " + " & ".join("\\multicolumn{2}{c}{%s}" % m for m in MODELS) + " \\\\",
+             "\\cmidrule(lr){2-3}\\cmidrule(lr){4-5}",
+             "Method & ms\\,/\\,round & \\% of decode & ms\\,/\\,round & \\% of decode \\\\",
+             "\\midrule"]
+    for m, label in ROWS:
+        cells = []
+        for mk in MODELS:
+            r = c.get((mk, m))
+            cells += ["--", "--"] if r is None else ["%.2f" % r[0], "%.2f\\%%" % r[1]]
+        pre = "\\rowcolor{oursbg} " if m == "random_pp" else ""
+        lines.append(pre + label + " & " + " & ".join(cells) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    root = os.environ.get("RA_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    ap.add_argument("--results", default=os.path.join(root, "regrade32k_results.tsv"))
+    ap.add_argument("--paired", default=None, help="paired_tests_<date>.txt")
+    ap.add_argument("--lcb", default=os.path.join(root, "figures/results_lcb.tsv"))
+    ap.add_argument("--tp", default=os.path.join(root, "logs/throughput_vase_protocol.tsv"))
+    ap.add_argument("--eff", default=os.path.join(root, "figures/effective_throughput.md"))
+    ap.add_argument("--vllm", default=os.path.join(root, "figures/results_vllm.tsv"))
+    ap.add_argument("--evictcost", default=os.path.join(root, "figures/results_evictcost.tsv"))
+    ap.add_argument("--isomem", default=os.path.join(root, "figures/results_isomem.tsv"))
+    ap.add_argument("--out", default=os.path.join(os.environ.get("RA_ROOT", "."), "tables"))
+    ap.add_argument("--only", default=None,
+                    help="comma-separated table names to write (default: all)")
+    ap.add_argument("--emit_paired_cmds", action="store_true")
+    args = ap.parse_args()
+
+    results = load_results(args.results)
+    lcb = load_lcb(args.lcb)
+
+    if args.emit_paired_cmds:
+        # one run per (base_a, data, base_b) group; the section header (used for marker
+        # lookup) is base_b, the base the B-side cells actually resolve to
+        seen = set()
+        for model in HEADLINE_MODELS + APPENDIX_MODELS:
+            for task in APPX_TASK_ORDER:
+                _, r_rp = resolve(results, lcb, model, task, "random_pp")
+                if not r_rp:
+                    continue
+                base_a, data = r_rp[0], TASKS[task][3]
+                by_base = defaultdict(list)
+                for row in ["vase", "snapkv", "rkv", "triattn"]:
+                    _, r = resolve(results, lcb, model, task, row)
+                    if r:
+                        by_base[r[0]].append(r[2])
+                for base_b, methods in by_base.items():
+                    if (base_a, data, base_b) in seen:
+                        continue
+                    seen.add((base_a, data, base_b))
+                    print("run_pair %s %s %s %s" % (base_a, data, ",".join(methods), base_b))
+        return
+
+    # --paired accepts a comma-separated list; later files override earlier ones per
+    # (base, data, method). The R-KV pairs live in paired_tests_20260802.txt, the
+    # VaSE/SnapKV pairs in paired_tests_20260728_pruned.txt -- pass BOTH, or the grid
+    # greys are incomplete (the 08-20 review found exactly that).
+    paired = defaultdict(dict)
+    for pf in (args.paired or "").split(","):
+        pf = pf.strip()
+        if pf:
+            for k, v in load_paired(pf).items():
+                paired[k].update(v)
+    paired.update(load_lcb_paired())
+    tp = load_throughput(args.tp)
+    eff = load_eff_md(args.eff)
+
+    os.makedirs(args.out, exist_ok=True)
+    caption_main = ("Accuracy under KV-cache eviction at each task's ${\\sim}4\\times$ "
+                    "compression (\\lcb{}: ${\\sim}3\\times$); the header gives each "
+                    "task's per-head KV budget $\\budget$ (\\S\\ref{sec:setting}). "
+                    "\\best{Bold} = best eviction method per column; \\sigbelow{grayed} "
+                    "= significantly below \\method{} (paired clustered bootstrap + "
+                    "sign test, 95\\%).")
+    caption_appx = ("Generality grid: Qwen3-14B, an intermediate scale in the headline "
+                    "family, with the same methods, budgets, rollout counts, and "
+                    "conventions as Table~\\ref{tab:main}.")
+    caption_strict = ("Strict-accuracy twin of Table~\\ref{tab:main} (answer correct AND "
+                      "generation terminated within the 32k cap).")
+
+    writes = {
+        "main_grid.tex": grid_table(results, lcb, paired, HEADLINE_MODELS, MAIN_TASK_ORDER,
+                                    "flag", "tab:main", caption_main),
+        "main_grid_strict.tex": grid_table(results, lcb, defaultdict(dict), HEADLINE_MODELS,
+                                           MAIN_TASK_ORDER, "strict", "tab:main_strict",
+                                           caption_strict),  # markers are flag-based; omit here
+        "appendix_grid.tex": grid_table(results, lcb, paired, APPENDIX_MODELS, APPX_TASK_ORDER,
+                                        "flag", "tab:appendix_grid", caption_appx),
+        "longtrace.tex": longtrace_table(results),
+        "mechanism.tex": mechanism_table(results),
+        "protection_ablation.tex": protection_table(results),
+        "promptprotect.tex": promptprotect_table(results),
+        "promptprotect_appendix.tex": promptprotect_appendix_table(results, lcb),
+        "efficiency.tex": efficiency_table(tp),
+        "gpuhours.tex": gpuhours_table(eff),
+        "vllm.tex": vllm_table(load_vllm(args.vllm)),
+        "isomem.tex": isomem_table(load_isomem(args.isomem)),
+        "evictcost.tex": evictcost_table(load_evictcost(args.evictcost)),
+    }
+    if args.only:
+        keep = {n if n.endswith(".tex") else n + ".tex" for n in args.only.split(",")}
+        unknown = keep - set(writes)
+        if unknown:
+            sys.exit("unknown table name(s): %s" % ", ".join(sorted(unknown)))
+        writes = {k: v for k, v in writes.items() if k in keep}
+    for name, content in writes.items():
+        with open(os.path.join(args.out, name), "w") as f:
+            f.write(content)
+        print("wrote %s" % os.path.join(args.out, name))
+
+
+if __name__ == "__main__":
+    main()

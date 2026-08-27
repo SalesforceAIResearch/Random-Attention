@@ -1,0 +1,62 @@
+--- refs/triattention/triattention/vllm/runtime/scheduler.py	2026-07-08 08:24:07.000000000 +0000
++++ scripts/vllm_rp_bench/shims/scheduler.py	2026-08-18 06:10:15.000000000 +0000
+@@ -19,6 +19,7 @@
+     clear_request_allocation_sync_state,
+     prepare_request_effective_num_computed,
+     update_request_effective_kv_offset,
++    update_request_effective_kv_offset_anchored,
+ )
+ from .planner import CompressionPlanner
+ from .request_key_compat import iter_scheduled_token_items
+@@ -440,10 +441,21 @@
+                         if _free_reclaimed_blocks(manager, removed_blocks):
+                             reclaim_applied_any = True
+                 if reclaim_applied_any:
+-                    update_request_effective_kv_offset(
+-                        request=req,
+-                        cache_len_after=cache_len_after,
+-                    )
++                    _nct_pre = event.get("scheduler_nct_pre") if isinstance(event, dict) else None
++                    if isinstance(_nct_pre, int):
++                        _new_off = update_request_effective_kv_offset_anchored(
++                            request=req, cache_len_after=cache_len_after,
++                            scheduler_nct_pre=_nct_pre)
++                        _legacy = int(getattr(req, "num_computed_tokens", 0)) - int(cache_len_after)
++                        if _new_off is not None and _legacy != _new_off:
++                            logger.info(
++                                "TriAttention anchored offset req=%s anchored=%d legacy_would_be=%d",
++                                req_id, _new_off, _legacy)
++                    else:
++                        update_request_effective_kv_offset(
++                            request=req,
++                            cache_len_after=cache_len_after,
++                        )
+                 continue
+             if not isinstance(managers, (list, tuple)):
+                 continue
+@@ -558,10 +570,21 @@
+                 )
+ 
+             if reclaim_applied_any:
+-                update_request_effective_kv_offset(
+-                    request=req,
+-                    cache_len_after=cache_len_after,
+-                )
++                _nct_pre = event.get("scheduler_nct_pre") if isinstance(event, dict) else None
++                if isinstance(_nct_pre, int):
++                    _new_off = update_request_effective_kv_offset_anchored(
++                        request=req, cache_len_after=cache_len_after,
++                        scheduler_nct_pre=_nct_pre)
++                    _legacy = int(getattr(req, "num_computed_tokens", 0)) - int(cache_len_after)
++                    if _new_off is not None and _legacy != _new_off:
++                        logger.info(
++                            "TriAttention anchored offset req=%s anchored=%d legacy_would_be=%d",
++                            req_id, _new_off, _legacy)
++                else:
++                    update_request_effective_kv_offset(
++                        request=req,
++                        cache_len_after=cache_len_after,
++                    )
+ 
+     def update_from_output(
+         self,

@@ -1,0 +1,22 @@
+--- refs/triattention/triattention/vllm/runtime/kv_group_resolver.py	2026-07-08 08:24:07.000000000 +0000
++++ scripts/vllm_rp_bench/shims/kv_group_resolver.py	2026-08-08 06:24:20.000000000 +0000
+@@ -108,10 +108,16 @@
+             if layer is None:
+                 continue
+             kv_cache_list = getattr(layer, "kv_cache", None)
+-            if not isinstance(kv_cache_list, list) or not kv_cache_list:
++            # SHIM (capture-layer only, 2026-08-08): vllm>=0.19 bind_kv_cache assigns the
++            # per-layer KV tensor directly (v1/worker/utils.py:511-512); older vllm used a
++            # list per virtual engine. Accept both. No selection/kernel semantics touched.
++            if isinstance(kv_cache_list, torch.Tensor):
++                tensor = kv_cache_list
++            elif isinstance(kv_cache_list, list) and kv_cache_list:
++                tensor = kv_cache_list[0]
++            else:
+                 continue
+-            tensor = kv_cache_list[0]
+-            if not isinstance(tensor, torch.Tensor):
++            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+                 continue
+             ptr = tensor.data_ptr()
+             if ptr in seen_ptrs:

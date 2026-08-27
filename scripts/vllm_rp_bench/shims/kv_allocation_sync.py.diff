@@ -1,0 +1,27 @@
+--- refs/triattention/triattention/vllm/runtime/kv_allocation_sync.py	2026-07-08 08:24:07.000000000 +0000
++++ scripts/vllm_rp_bench/shims/kv_allocation_sync.py	2026-08-18 06:10:15.000000000 +0000
+@@ -92,3 +92,24 @@
+     if effective > logical:
+         return None
+     return effective
++
++
++def update_request_effective_kv_offset_anchored(
++    *, request: Any, cache_len_after: Any, scheduler_nct_pre: Any
++) -> int | None:
++    """SHIM (08-18): offset = nct_pre - cache_len_after, BOTH pre-forward quantities of
++    the compression step, so effective(t) = logical(t) - offset equals the true compacted
++    length at every later step, independent of when registration runs relative to
++    schedule-time nct advancement or batch-queue lookahead. (Legacy path used live
++    num_computed_tokens, overstating the offset by 1 + lookahead_depth -> every
++    block-boundary allocation late by that many steps -> orphaned boundary token.)"""
++    nct = _to_non_negative_int(scheduler_nct_pre)
++    eff = _to_non_negative_int(cache_len_after)
++    if nct is None or eff is None:
++        return None
++    offset = nct - eff
++    if offset <= 0:
++        clear_request_allocation_sync_state(request)
++        return 0
++    setattr(request, EFFECTIVE_KV_OFFSET_ATTR, offset)
++    return offset
