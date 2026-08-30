@@ -61,7 +61,7 @@ case $METHOD in
   caote)      ARGS="$EV --eviction_mode caote --smooth";                                     DIR=caote ;;
   recency_pp) ARGS="$EV --eviction_mode recency_pp";                                         DIR=recency_pp ;;
   rkv_official) ARGS="$EV --eviction_mode rkv_official --rkv_lambda 0.1";                    DIR=rkv_official ;;
-  snapkv_pp)  ARGS="$EV --eviction_mode attn_pp";                                            DIR=attn_pp ;;
+  snapkv_pp)  ARGS="$EV --eviction_mode attn_pp --smooth";                                   DIR=attn_pp ;;
   rkv_pp)     ARGS="$EV --eviction_mode attn_rkv_pp --rkv_lambda 0.5 --smooth";              DIR=attn_rkv_pp ;;
   vase_pp)    ARGS="$EV --eviction_mode range_sink_sample_attn_pp --n_large $NL --smooth";   DIR=vase_pp ;;
   triattn)    ARGS="$EV --eviction_mode triattn_ph --n_large 256";                           DIR=triattn_ph_memofix
