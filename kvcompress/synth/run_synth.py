@@ -61,6 +61,7 @@ def main():
     ap.add_argument("--n_large", type=int, default=256)     # K/4 for the faithful vase arm
     ap.add_argument("--free_tokens", type=int, default=32)
     ap.add_argument("--parity", action="store_true")
+    ap.add_argument("--triattn_stats", default=None, help="TriAttention calibration stats (default: by model name)")
     ap.add_argument("--seed", type=int, default=None,
                     help="registered per-arm eviction-RNG seed (S3 amendment; recorded in .done)")
     args = ap.parse_args()
@@ -74,7 +75,18 @@ def main():
     assert args.eviction_mode in ("synth_pin", "range_sink_sample_attn", "attn", "triattn_ph", "attn_rkv"), \
         "registered arms only (natural-rp = synth_pin with spec [])"
     if args.eviction_mode == "triattn_ph":
-        os.environ["TRIATTN_STATS"] = os.path.join(os.environ.get("RA_ENGINE", os.path.join(os.environ.get("RA_ROOT", "."), "kvcompress/harness")), "stats_pl/qwen3-4b.pt")
+        os.environ["TRIATTN_FIX_MEMO"] = "1"
+        _m = {"Qwen3-4B": "qwen3-4b.pt", "Qwen3-14B": "qwen3-14b.pt", "Qwen3-32B": "qwen3-32b.pt",
+              "phi-4-reasoning": "phi-4.pt", "DeepSeek-R1-Distill-Llama-8B": "deepseek.pt"}
+        _b = os.path.basename(args.model_dir.rstrip("/"))
+        if not args.triattn_stats:
+            # NEVER fall back silently: a wrong stats file either shape-crashes (lucky) or silently
+            # mis-scores the tri arm (08-31 lesson: an unrecognized model dir name loaded the Qwen stats).
+            assert _b in _m, f"unknown model dir {_b!r}: pass --triattn_stats explicitly"
+        os.environ["TRIATTN_STATS"] = args.triattn_stats or os.path.join(
+            os.environ.get("RA_ENGINE", os.path.join(os.environ.get("RA_ROOT", "."), "kvcompress/harness")),
+            "stats_pl", _m[_b])
+        assert os.path.exists(os.environ["TRIATTN_STATS"]), os.environ["TRIATTN_STATS"]
 
     if args.eviction_mode == "synth_pin":
         spec = json.loads(args.spec or "[]")

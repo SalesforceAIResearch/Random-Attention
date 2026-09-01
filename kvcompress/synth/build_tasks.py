@@ -75,16 +75,21 @@ def harvest_filler(paths, tok, need_tokens, seed):
 
 def build_filler_ids(texts, tok, n_tok, forbid, rng):
     """Concatenate screened reasoning text, tokenize, and cut to exactly n_tok tokens."""
-    buf, have = [], 0
-    while have < n_tok * 5:  # chars budget
-        t = texts[rng.randrange(len(texts))]
-        if any(f in t for f in forbid):
-            continue
-        buf.append(t)
-        have += len(t)
-    ids = tok("".join(buf), add_special_tokens=False).input_ids
-    if len(ids) < n_tok:
-        raise RuntimeError("filler pool exhausted")
+    # chars-per-token differs by tokenizer (Qwen3 ~3.5 on math text, Phi-4 ~4.5+), so grow the buffer
+    # until the TOKENIZED length covers n_tok instead of assuming a fixed chars budget.
+    buf, have, ids, tries = [], 0, [], 0
+    while len(ids) < n_tok:
+        while have < n_tok * 5 or not buf:
+            t = texts[rng.randrange(len(texts))]
+            if any(f in t for f in forbid):
+                tries += 1
+                if tries > 10000:
+                    raise RuntimeError("filler pool exhausted (screen rejects everything)")
+                continue
+            buf.append(t)
+            have += len(t)
+        ids = tok("".join(buf), add_special_tokens=False).input_ids
+        have = 0 if len(ids) < n_tok else have   # short: draw more text and re-tokenize
     return ids[:n_tok]
 
 
@@ -95,6 +100,10 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.environ.get("RA_ROOT", "."), "results/synth_tasks"))
     ap.add_argument("--n", type=int, default=500)   # max n; nested prefixes 250/400/500
     ap.add_argument("--seed", type=int, default=20260723)
+    ap.add_argument("--minimal_stub", action="store_true",
+                    help="build the prefill stub as a bare user/assistant turn (no system prompt) -- needed for "
+                         "models whose default template injects a long system prompt (Phi-4-reasoning: 241 tokens); "
+                         "the stub must stay under one residual chunk (64 tokens)")
     ap.add_argument("--force_out", action="store_true",
                     help="override the clobber guard; only for a deliberate rebuild of the SAME model's tasks")
     args = ap.parse_args()
@@ -125,8 +134,17 @@ def main():
     # ---- stub (prefill): chat template + <think> opener --------------------------------
     msgs = [{"role": "user", "content":
              "Work through a long chain of small reasoning steps. Track every defined variable."}]
-    stub_text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    if args.minimal_stub:
+        # Phi-4-style tags, taken from the tokenizer's own template output (user turn + assistant opener)
+        full = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        i = full.rfind("<|im_start|>user")
+        assert i >= 0, "minimal_stub assumes <|im_start|>user ... <|im_start|>assistant<|im_sep|> tags"
+        stub_text = full[i:]
+    else:
+        stub_text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     stub_ids = tok(stub_text, add_special_tokens=False).input_ids
+    from transformers import AutoConfig
+    n_kv = int(AutoConfig.from_pretrained(args.model_dir).num_key_value_heads)
     assert len(stub_ids) < 64, f"stub too long ({len(stub_ids)}) — must stay below one residual chunk"
 
     # ---- cells: (name, filler_pre, age_tokens[needle-end -> measurement]) ---------------
@@ -195,14 +213,13 @@ def main():
             else:
                 target = v_x
             val_ids = tok(str(target), add_special_tokens=False).input_ids
-            NV_EXPECT = {"a1536_s1b": 5, "a1536_s2s": 4}
-            if cell == "a1536_s2r":                 # 4 + sep + 4; sep token count fixed by ", "
-                if i == 0:
-                    nv_cell = len(val_ids)
-                    assert nv_cell in (9, 10), (target, val_ids)
-            else:
-                nv_cell = NV_EXPECT.get(cell, 4)
-            assert len(val_ids) == nv_cell, (cell, target, len(val_ids))
+            # Value token counts are TOKENIZER-dependent (Qwen3: one token per digit -> 4-digit = 4 tokens,
+            # s2r "x, y" = 9-10; Phi-4: 4-digit = 2 tokens, s2r = 6). They must be constant within a cell
+            # (grading is positional over the last NV forced tokens): fix them from instance 0, assert after.
+            nvx_i = len(tok(str(v_x), add_special_tokens=False).input_ids)
+            if i == 0:
+                nv_cell, nv_x = len(val_ids), nvx_i
+            assert len(val_ids) == nv_cell and nvx_i == nv_x, (cell, target, len(val_ids), nvx_i)
             assert tok.decode(n_ids).find(str(v_x)) > 0
             forbid = [f" {var} ", str(v_x), str(v_y), f"{var}2", "passcode"]
             # Constant-size boxes: needle token counts vary per instance (vars/digits tokenize
@@ -245,14 +262,16 @@ def main():
         torch.save(torch.tensor(inst, dtype=torch.long), os.path.join(d, "instances.pt"))
         meta = {"stub_ids": stub_ids, "L_forced": L, "total": total, "E": E,
                 "span_x": [spans[0], spans[1]], "span_y": [spans[2], spans[3]],
-                "n_val_tokens": nv_cell,
+                "n_val_tokens": nv_cell, "n_val_x": nv_x, "n_kv_heads": n_kv,
+                "stub_minimal": bool(args.minimal_stub), "model_dir": args.model_dir,
                 "value_pos": [len(stub_ids) + L - nv_cell, len(stub_ids) + L],
-                "s_E": (1024 / 1088) ** E, "union_pred": 1 - (1 - (1024 / 1088) ** E) ** 8,
+                "s_E": (1024 / 1088) ** E, "union_pred": 1 - (1 - (1024 / 1088) ** E) ** n_kv,
                 "tb": TB, "res": RES, "values": values,
                 **({"val_off": val_off} if cell == "a1536_fragv" else {})}
         json.dump(meta, open(os.path.join(d, "meta.json"), "w"))
         summary[cell] = {"total": total, "E": E, "s_E": round(meta["s_E"], 4),
-                         "union8": round(meta["union_pred"], 4)}
+                         "union_all_heads": round(meta["union_pred"], 4), "n_kv_heads": n_kv,
+                         "n_val_tokens": nv_cell, "n_val_x": nv_x, "stub_tokens": len(stub_ids)}
         print(cell, summary[cell])
     json.dump(summary, open(os.path.join(args.out, "summary.json"), "w"), indent=1)
 

@@ -43,8 +43,8 @@ bash setup.sh                 # Python 3.10 venv: torch 2.4.0 (cu121), flash-att
 
 * **Models**: Hugging Face checkpoints under `$RA_MODELS_DIR/<name>` (default `models/`): `Qwen3-4B`,
   `Qwen3-14B`, `Qwen3-32B`, `phi-4-reasoning`, optionally `DeepSeek-R1-Distill-Llama-8B`.
-* **Data**: `$RA_DATA_DIR/<task>/test.jsonl` -- see `data/README.md` for the format, sources and the frozen
-  AIME-2025 convention. Our LiveCodeBench subsets are included.
+* **Data**: `$RA_DATA_DIR/<task>/test.jsonl` -- see `data/README.md` for the format, sources and the note
+  on the paper's AIME-2025 problem count. Our LiveCodeBench subsets are included.
 * Hardware: the paper's cells ran on 8x H200 (141 GB) or 8x A100 (80 GB); 32B needs one worker per GPU.
 
 ## Run an accuracy cell

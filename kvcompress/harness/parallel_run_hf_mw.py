@@ -24,10 +24,12 @@ def choose_task_config(model_size):
     # (32B included -- it just runs at WPG=1). n_examples must match the dataset.
     task_config = {
         "aime24":        {"bs": 2,   "total_run": 8,  "n_examples": 30},
-        "aime25":        {"bs": 2,   "total_run": 8,  "n_examples": 29},  # FROZEN CONVENTION (decided
-        # 2026-07-25): dataset has 30 problems; this original typo means EVERY aime25 cell in the
-        # project ran the same 29 (problem id 29 excluded). Matched across methods => comparisons
-        # valid. DO NOT change to 30 — it would shard-misalign every existing cell's resume.
+        "aime25":        {"bs": 2,   "total_run": 8,  "n_examples": 30},
+        # The paper's AIME-2025 cells were run over the first 29 of these 30 problems -- the same
+        # 29 for every method, so all reported comparisons are matched, and the paper states the
+        # counts ("29 and 30 problems, pooled"). To reproduce those cells exactly, set
+        # n_examples to 29 here before launching (never change it for an already-started cell:
+        # sharding is positional).
         "aime26":        {"bs": 2,   "total_run": 8,  "n_examples": 30},
         "hmmt":          {"bs": 16,  "total_run": 16, "n_examples": 60},
         "math":          {"bs": 2,  "total_run": 2,  "n_examples": 500},
@@ -36,8 +38,6 @@ def choose_task_config(model_size):
         "livecodebench": {"bs": 8,  "total_run": 8,  "n_examples": 383},
         "livecodebench_hard": {"bs": 4,  "total_run": 4,  "n_examples": 350},
         "livecodebench_easy": {"bs": 4,  "total_run": 4,  "n_examples": 322},
-        "livecodebench_sub120": {"bs": 2,  "total_run": 2,  "n_examples": 120},
-        "livecodebench_r263": {"bs": 4,  "total_run": 4,  "n_examples": 263},
     }
     return task_config
 

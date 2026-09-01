@@ -26,7 +26,7 @@ pip install --extra-index-url https://download.pytorch.org/whl/cu121 torch==2.4.
 pip install --no-build-isolation flash-attn==2.7.3          # needs torch + nvcc present
 pip install -r requirements.txt
 # LiveCodeBench difficulty subsets ship with the repo; the graders expect data/<subset>/test.jsonl
-for s in easy hard medium r263 sub120; do
+for s in easy hard medium; do
   mkdir -p "data/livecodebench_$s"
   [ -e "data/livecodebench_$s/test.jsonl" ] || ln -s "../lcb_subsets/livecodebench_$s.test.jsonl" "data/livecodebench_$s/test.jsonl"
 done
