@@ -8,7 +8,7 @@ substantially rewritten: NUM_SHARDS positional data sharding (fixed per cell; th
 problems positionally), WORKERS_PER_GPU rank reuse, SHARD_SUBSET cross-node splitting, per-task
 batch/rollout overrides, and the faithfulness marker (nl=K/4) in the output directory name.
 Spawns one eval_hf.py process per (rollout batch, shard); resume-safe via --use_batch_exist.
-See docs/METHODS.md for the per-method flags and scripts/run_cell.sh for the canonical launcher.
+See scripts/run_cell.sh for the per-method flags and the canonical launcher.
 """
 import subprocess
 import os
@@ -25,11 +25,6 @@ def choose_task_config(model_size):
     task_config = {
         "aime24":        {"bs": 2,   "total_run": 8,  "n_examples": 30},
         "aime25":        {"bs": 2,   "total_run": 8,  "n_examples": 30},
-        # The paper's AIME-2025 cells were run over the first 29 of these 30 problems -- the same
-        # 29 for every method, so all reported comparisons are matched, and the paper states the
-        # counts ("29 and 30 problems, pooled"). To reproduce those cells exactly, set
-        # n_examples to 29 here before launching (never change it for an already-started cell:
-        # sharding is positional).
         "aime26":        {"bs": 2,   "total_run": 8,  "n_examples": 30},
         "hmmt":          {"bs": 16,  "total_run": 16, "n_examples": 60},
         "math":          {"bs": 2,  "total_run": 2,  "n_examples": 500},

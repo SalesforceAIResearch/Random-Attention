@@ -19,7 +19,7 @@
 #   task  : math | gpqa | aime25 | aime26 | hmmt | livecodebench | livecodebench_easy | livecodebench_hard
 #   method: dense | random_pp | snapkv | rkv | vase | triattn | caote | recency_pp | rkv_official
 #           | snapkv_pp | rkv_pp | vase_pp        (matched-protection variants, paper Table 2 / appendix)
-#   K     : KV budget in tokens (default = the paper's ~4x point for the task; see docs/METHODS.md)
+#   K     : KV budget in tokens (default = the paper's ~4x point for the task)
 # Env knobs: NGPU (default 8), WPG (workers per GPU; default per model), NUM_SHARDS (default 16 -- FIXED per
 #   cell, never change it for an existing cell), CUDA_VISIBLE_DEVICES, RUNS (override rollouts/problem).
 # Re-running the same command resumes the cell (batch_exist); completions land in

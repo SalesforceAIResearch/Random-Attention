@@ -13,7 +13,7 @@ range_sink_sample_attn/VaSE, caote, recency, ...) are theirs; Random Attention a
   * rkv_official (R-KV with the authors' lambda), the budget-parity guard, chronological compaction,
     the KEEPLOG / KEEPLOG_POS retention loggers, EVICT_TIMING hooks, and the mechanism-study modes
     (carrier_mix / softmix, random_pcap, synth_pin, FORCE_KEEP_RANGE replay).
-See docs/PROVENANCE.md for the exact diff against upstream.
+See THIRD_PARTY_NOTICES.md for file-level provenance.
 """
 from typing import Any, Optional
 import math

@@ -2,7 +2,7 @@
 # (the original portions remain under their own license -- see the provenance note below and THIRD_PARTY_NOTICES.md)
 # Derived from VaSE's eval/reasoning_tasks/modified/transformers/modify_forward.py (https://github.com/terarachang/VaSE, MIT,
 # commit bfa2692): the Qwen3 evict-attention forward is upstream's; Random Attention adds the phi3
-# (Phi-4-reasoning) and llama (DeepSeek-R1-Distill-Llama) forward patches (+108 lines). See docs/PROVENANCE.md.
+# (Phi-4-reasoning) and llama (DeepSeek-R1-Distill-Llama) forward patches (+108 lines). See THIRD_PARTY_NOTICES.md.
 import torch
 from typing import Optional
 from transformers.cache_utils import Cache

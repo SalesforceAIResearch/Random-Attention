@@ -34,4 +34,4 @@ echo
 echo "Environment ready. Next:"
 echo "  1. put the benchmark files under data/<task>/test.jsonl   (data/README.md)"
 echo "  2. put the model checkpoints under models/<name>            (or export RA_MODELS_DIR)"
-echo "  3. . env.sh && scripts/run_cell.sh Qwen3-4B math random_pp   (docs/METHODS.md for every method)"
+echo "  3. . env.sh && scripts/run_cell.sh Qwen3-4B math random_pp   (the header of scripts/run_cell.sh lists every method)"

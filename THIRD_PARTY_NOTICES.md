@@ -1,6 +1,18 @@
 # Third-party notices
 
-Portions of this repository are derived from the projects below (file-level map in `docs/PROVENANCE.md`).
+Portions of this repository are derived from the projects below. File-level map (upstream commit `bfa2692`
+for VaSE, `9c26d14` for TriAttention; every derived file also carries a provenance header):
+
+| file | origin | status |
+|---|---|---|
+| `kvcompress/engine/cache_utils.py` | VaSE `modified/transformers/cache_utils.py` (itself from HF transformers) | modified: Random Attention, `*_pp` variants, faithful TriAttention, loggers, mechanism modes |
+| `kvcompress/engine/modify_forward.py` | VaSE `modified/transformers/modify_forward.py` | modified: + phi3 and llama forward patches |
+| `kvcompress/engine/triattn_official.py` | TriAttention `methods/pruning_utils.py` | ported scoring functions, verbatim |
+| `kvcompress/harness/eval_hf.py`, `generation_utils.py` | VaSE same paths | import/path lines only |
+| `kvcompress/harness/my_utils.py`, `Utils/**`, `prompts/**`, `data/lcb_subsets/download_tests.py` | VaSE same paths | unmodified copies |
+| `kvcompress/harness/vase_protocol_throughput.py` | VaSE `benchmark/throughput.py` | one-line fix |
+| `kvcompress/harness/parallel_run_hf_mw.py` | descends from VaSE `parallel_run_hf.py` | rewritten (sharding, multi-worker, overrides) |
+| `scripts/vllm_rp_bench/shims/*.py` | TriAttention vLLM runtime files | modified copies (`.diff` beside each) |
 
 ## VaSE -- MIT License
 
