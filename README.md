@@ -43,7 +43,7 @@ bash setup.sh                 # Python 3.10 venv: torch 2.4.0 (cu121), flash-att
   `Qwen3-14B`, `Qwen3-32B`, `phi-4-reasoning`, optionally `DeepSeek-R1-Distill-Llama-8B`.
 * **Data**: `$RA_DATA_DIR/<task>/test.jsonl` -- see `data/README.md` for the format and sources. Our
   LiveCodeBench subsets are included.
-* Hardware: the paper's cells ran on 8x H200 (141 GB).
+* **Hardware**: the paper's experiments ran on 8x H200 (141 GB).
 
 ## Run an accuracy cell
 
