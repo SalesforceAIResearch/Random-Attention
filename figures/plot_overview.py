@@ -50,29 +50,35 @@ GRID = os.environ.get("MAIN_GRID", os.path.expanduser(
     "~/Random-Attention-ICLR-27/tables/main_grid.tex"))
 ROWKEY = {"\\dense{}": "full", "\\snapkv{}": "snapkv", "\\rkv{}": "rkv", "\\vase{}": "vase",
           "\\triattn{}": "triattn", "\\method{} (ours)": "rp"}
-MODELS_A = ["Qwen3-4B", "Phi-4-reasoning", "Qwen3-32B"]   # block order in main_grid.tex
-acc, blk = {}, -1
-for ln in open(GRID):
-    ln = ln.strip()
-    if ln.startswith("%") or "&" not in ln:
-        continue
-    cells = [c.strip() for c in ln.rstrip("\\").split("&")]
-    key = cells[0].replace("\\rowcolor{oursbg}", "").strip()
-    if key not in ROWKEY:
-        continue
-    if ROWKEY[key] == "full":
-        blk += 1
-    vals = []
-    for c in cells[1:]:
-        m = re.search(r"(\d\.\d{3})", c)
-        if m:
-            vals.append(float(m.group(1)))
-    assert len(vals) == 5, (ln, vals)
-    # TASKS=nocode -> mean over the four math/science columns (MATH, GPQA, AIME, HMMT)
-    if os.environ.get("TASKS", "all") == "nocode":
-        vals = vals[:4]
-    acc[(MODELS_A[blk], ROWKEY[key])] = float(np.mean(vals))
-assert blk == 2, "expected three model blocks in main_grid.tex"
+MAIN_BLOCKS = ["Qwen3-4B", "Phi-4-reasoning", "Qwen3-32B"]   # block order in main_grid.tex
+MODELS_A = ["Qwen3-4B", "Phi-4-reasoning", "Qwen3-14B", "Qwen3-32B"]  # display order (matches panel b)
+APPX_GRID = os.environ.get("APPX_GRID", os.path.expanduser(
+    "~/Random-Attention-ICLR-27/tables/appendix_grid.tex"))
+acc = {}
+def parse_grid(path, blocks):
+    blk = -1
+    for ln in open(path):
+        ln = ln.strip()
+        if ln.startswith("%") or "&" not in ln:
+            continue
+        cells = [c.strip() for c in ln.rstrip("\\").split("&")]
+        key = cells[0].replace("\\rowcolor{oursbg}", "").strip()
+        if key not in ROWKEY:
+            continue
+        if ROWKEY[key] == "full":
+            blk += 1
+        vals = []
+        for c in cells[1:]:
+            m = re.search(r"(\d\.\d{3})", c)
+            if m:
+                vals.append(float(m.group(1)))
+        assert len(vals) == 5, (ln, vals)
+        if os.environ.get("TASKS", "all") == "nocode":
+            vals = vals[:4]
+        acc[(blocks[blk], ROWKEY[key])] = float(np.mean(vals))
+    return blk
+assert parse_grid(GRID, MAIN_BLOCKS) == 2, "expected three model blocks in main_grid.tex"
+assert parse_grid(APPX_GRID, ["Qwen3-14B"]) == 0, "expected one model block in appendix_grid.tex"
 
 # ---------------------------------------------------------------- (b) vLLM throughput
 TP = {}
@@ -85,8 +91,8 @@ for ln in open(os.path.join(HERE, "results_vllm.tsv")):
 MODELS_B = ["Qwen3-4B", "phi-4-reasoning", "Qwen3-14B", "Qwen3-32B"]
 
 # ---------------------------------------------------------------- draw
-fig, (axA, axB) = plt.subplots(1, 2, figsize=(9.4, 2.75),
-                               gridspec_kw={"width_ratios": [2.8, 2.4], "wspace": 0.26})
+fig, (axA, axB) = plt.subplots(1, 2, figsize=(9.4, 2.4),
+                               gridspec_kw={"width_ratios": [2.7, 2.7], "wspace": 0.26})
 METH = [("full", "full attention", DGRAY), ("snapkv", "SnapKV", BLUE), ("rkv", "R-KV", BLUE),
         ("vase", "VaSE", BLUE), ("triattn", "TriAttention", BLUE), ("rp", "Random Attention", RED)]
 w = 0.13
@@ -98,8 +104,13 @@ for gi, model in enumerate(MODELS_A):
         alpha = 0.55 if k in ("snapkv", "rkv", "vase") else 1.0
         axA.bar(x, v, width=w * 0.92, color=col, alpha=alpha, zorder=3,
                 label=lab if gi == 0 else None)
+    d = 100 * (acc[(model, "rp")] - acc[(model, "triattn")])
+    ytop = max(acc[(model, "rp")], acc[(model, "triattn")])
+    axA.annotate(f"{d:+.1f}", (x0 + 2.0 * w, ytop), xytext=(0, 3),
+                 textcoords="offset points", ha="center", va="bottom",
+                 fontsize=8, color="#57544f", zorder=5)
 axA.set_xticks(range(len(MODELS_A)))
-axA.set_xticklabels(["Qwen3-4B", "Phi-4-reasoning", "Qwen3-32B"])
+axA.set_xticklabels(["Qwen3-4B", "Phi-4", "Qwen3-14B", "Qwen3-32B"], fontsize=8.5)
 axA.set_ylim(0.3, 0.8)
 axA.set_yticks(np.arange(0.3, 0.81, 0.1))
 axA.set_ylabel("Avg. Accuracy" if os.environ.get("TASKS", "all") != "nocode"
@@ -125,7 +136,7 @@ for gi, model in enumerate(MODELS_B):
                  textcoords="offset points", ha="center", fontsize=9, color=RED,
                  fontweight="bold")
 axB.set_xticks(range(len(MODELS_B)))
-axB.set_xticklabels(["Qwen3-4B", "Phi-4", "Qwen3-14B", "Qwen3-32B"], fontsize=9)
+axB.set_xticklabels(["Qwen3-4B", "Phi-4", "Qwen3-14B", "Qwen3-32B"], fontsize=8.5)
 axB.set_ylabel("tokens / s")
 axB.set_title("(b) vLLM serving throughput, 32k", loc="center")
 axB.set_ylim(0, 2600)

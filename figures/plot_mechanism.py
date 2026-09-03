@@ -120,7 +120,7 @@ def yerr(rows, lo_key, hi_key, val_key):
 
 # ------------------------------------------------------------------- figure
 fig, (axA, axB, axC) = plt.subplots(
-    1, 3, figsize=(10.6, 3.3), gridspec_kw={"width_ratios": [1.35, 1.0, 1.0]})
+    1, 3, figsize=(10.6, 2.8), gridspec_kw={"width_ratios": [1.35, 1.0, 1.0]})
 # the by-age keep-log panel is a standalone appendix figure (fig_keeplog)
 figK, axD = plt.subplots(1, 1, figsize=(4.8, 3.3))
 
@@ -202,10 +202,17 @@ axC.set_title("(c) Real MATH500: shape is free", pad=8)
 UNION_TSV = os.path.join(ROOT, "figures", "union_by_age.tsv")
 U = {}
 with open(UNION_TSV) as fh:
-    next(fh)
     for ln in fh:
-        m, lo, hi, sv, un, ind = ln.split("\t")
-        U.setdefault(m, []).append((int(lo), float(sv), float(un), float(ind)))
+        if ln.startswith("#") or not ln.strip():
+            continue
+        parts = ln.rstrip("\n").split("\t")
+        if len(parts) < 6:
+            continue
+        m, lo, hi, sv, un, ind = parts[:6]
+        try:
+            U.setdefault(m, []).append((int(lo), float(sv), float(un), float(ind)))
+        except ValueError:
+            continue  # header row
 BANDS = [(512, "512"), (1024, "1k"), (2048, "2k"), (4096, "4k")]
 keys = [b for b, _ in BANDS]
 xu = np.arange(len(keys))

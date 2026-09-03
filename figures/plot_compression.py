@@ -56,7 +56,7 @@ TASKS = ["math", "gpqa", "aime", "hmmt"]
 d = collections.defaultdict(lambda: collections.defaultdict(lambda: collections.defaultdict(list)))
 dense = collections.defaultdict(dict)
 with open(TSV) as f:
-    for r in csv.DictReader(f, delimiter="\t"):
+    for r in csv.DictReader((ln for ln in f if not ln.startswith("#")), delimiter="\t"):
         acc = float(r["flag_acc"]); m, t, c, meth = r["model"], r["task"], r["comp"], r["method"]
         if meth == "dense": dense[m][t] = acc; continue
         if c in COMP_X: d[m][t][meth].append((COMP_X[c], acc))
@@ -68,7 +68,7 @@ ncol = len([t for t in TASKS if any(d[m][t] for m in MODELS)]) or 1
 nrow = len([m for m in MODELS if d[m]]) or 1
 rows = [m for m in MODELS if any((m, t) in present for t in TASKS)]
 cols = [t for t in TASKS if any((m, t) in present for m in rows)]
-fig, axes = plt.subplots(len(rows), len(cols), figsize=(3.2*len(cols), 2.7*len(rows)),
+fig, axes = plt.subplots(len(rows), len(cols), figsize=(3.2*len(cols), 2.1*len(rows)),
                          squeeze=False, sharex=True)
 for ri, m in enumerate(rows):
     for ci, t in enumerate(cols):
@@ -90,19 +90,29 @@ for ri, m in enumerate(rows):
             mk, ms, mew = MK.get(meth, ("o", 5, 1.5))
             ax.plot(xs, ys, "-", marker=mk, color=C[meth], lw=2, ms=ms, mew=mew,
                     label=LBL[meth], zorder=Z.get(meth, 3))
-            ends.append((ys[-1], xs[-1], meth))
+            ends.append((ys[-1], xs[-1], meth, xs[-1] < xmax_panel))
             if xs[-1] < xmax_panel:     # method infeasible at the deepest compression -> x mark
                 ax.plot([xmax_panel + 0.09 * n_x], [0.045 * top], marker="x", ms=9, mew=2.6,
                         color=C[meth], zorder=4, clip_on=False)
                 n_x += 1
         # second pass: greedy top-down dodge in data coords — labels keep >= min_sep spacing
-        min_sep = 0.055 * top
+        min_sep = 0.095 * top
         y_lab_prev = None
-        for y_end, x_end, meth in sorted(ends, reverse=True):
+        for y_end, x_end, meth, trunc in sorted(ends, reverse=True):
+            if trunc and meth == "triattn_ph":
+                # truncated tri curve: other lines continue to the right -> label below-left
+                if m == "Qwen3-4B":
+                    xytext = (-2, 0)
+                else:
+                    xytext = (0, -5)
+                ax.annotate(f"{y_end:.2f}", (x_end, y_end), color=C[meth], va="top",
+                            ha="right", fontsize=9, fontweight="bold", xytext=xytext,
+                            textcoords="offset points", zorder=7)
+                continue
             y_lab = y_end if y_lab_prev is None else min(y_end, y_lab_prev - min_sep)
             y_lab_prev = y_lab
             ax.annotate(f"{y_end:.2f}", (x_end, y_lab), color=C[meth], va="center",
-                        fontsize=9.5, fontweight="bold", xytext=(5, 0),
+                        fontsize=9, fontweight="bold", xytext=(5, 0),
                         textcoords="offset points", zorder=7)
         if t in dense[m]:
             ax.axhline(dense[m][t], color=C["dense"], ls="--", lw=1.3, alpha=.8, zorder=1)
