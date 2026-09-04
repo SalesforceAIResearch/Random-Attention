@@ -2,6 +2,8 @@
 
 Code for the paper [*Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning*](https://arxiv.org/abs/2609.03430) (arXiv:2609.03430).
 
+📄 [Paper (arXiv:2609.03430)](https://arxiv.org/abs/2609.03430) · 🧵 [Thread](https://x.com/HengWang_uiuc/status/2095685764302475563)
+
 **Random Attention** (`random_pp` in the code) is a signal-free KV-cache eviction policy for reasoning models:
 keep the prompt, then keep a *uniformly random* per-KV-head subset of the generated tokens up to the budget
 (plus a short recency window). It reads no attention scores, no value statistics, and no calibration data, so
