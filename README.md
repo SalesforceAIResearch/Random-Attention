@@ -1,6 +1,6 @@
 # Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning
 
-Code for the paper *Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning*.
+Code for the paper [*Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning*](https://arxiv.org/abs/2609.03430) (arXiv:2609.03430).
 
 **Random Attention** (`random_pp` in the code) is a signal-free KV-cache eviction policy for reasoning models:
 keep the prompt, then keep a *uniformly random* per-KV-head subset of the generated tokens up to the budget
@@ -101,7 +101,13 @@ the TriAttention baseline and the vLLM serving benchmark build on
 
 ```bibtex
 @article{randomattention2026,
-  title   = {Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning},
-  year    = {2026}
+  title         = {Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning},
+  author        = {Heng Wang and Jielin Qiu and Wenting Zhao and Cheng Qian and Liangwei Yang and Jiawei Han and Heng Ji and Silvio Savarese and Shelby Heinecke and Huan Wang},
+  journal       = {arXiv preprint arXiv:2609.03430},
+  year          = {2026},
+  eprint        = {2609.03430},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL},
+  url           = {https://arxiv.org/abs/2609.03430}
 }
 ```
